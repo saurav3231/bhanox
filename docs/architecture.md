@@ -145,13 +145,27 @@ selects decay rates.
 
 ## Batch semantics
 
-The recurrent state is a **single instance**. `forward(B, T)` is therefore
-exactly one concatenated stream: row 0 fully, then row 1 against the state row 0
-left behind. `forward(stack([a, b]))` is identical to
-`forward(concatenate([a, b]))`.
+The recurrent state carries a **sample axis**: `(B, d_k, d_v)` for the
+DeltaBank, `(B, n_channels)` for the PulseGate. Sample `b` reads only what
+sample `b` wrote, so `forward(stack([a, b]))` is no longer
+`forward(concatenate([a, b]))`. A batched loss measures what it claims to.
 
-Batching buys nothing for the memory path — it is the mixer that vectorises. Do
-not assume row independence in a loss; per-sample state is an M2 concern.
+Two claims, deliberately kept apart:
+
+- **State is exact.** The recurrence is int32, so a batched row and the
+  equivalent single-stream run leave states that compare equal with `==`.
+- **Logits are approximate.** Logits are float32 out of a matmul over a
+  `(B, T)` block, and BLAS sums a batched product in a different order than a
+  single-row one. Compare logits with `allclose`, state with `array_equal`.
+
+The time loop stays outermost in `_run_memory`, because the recurrence is
+sequential in `t` and there is nothing to vectorise across it. The batch is
+real rather than a throughput knob for the mixer alone.
+
+Batch-1 behaviour is unchanged by this work, and that was measured rather than
+assumed: on the nano config, the same prompt gives the same int32 state, the
+same gate decisions per token, and float32 logits bit-identical to the
+pre-M2 path (`max|diff| == 0.0`). See the note on `Bhanox.forward`.
 
 ## Assembly
 

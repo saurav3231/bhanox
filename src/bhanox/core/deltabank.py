@@ -51,6 +51,7 @@ from bhanox.quant.numerics import (
     saturate_int8,
     to_q,
 )
+from bhanox.seeding import init_rng
 
 __all__ = ["DeltaBankHead", "l2_normalize", "recip_lut"]
 
@@ -173,6 +174,9 @@ class DeltaBankHead:
     read_before_write: bool = True
     use_read_gate: bool = True
     write_mode: str = "delta"
+    seed: int = 0
+    name: str = "custom"
+    head_index: int = 0
 
     def __post_init__(self) -> None:
         """Allocate projections and the state.
@@ -180,8 +184,13 @@ class DeltaBankHead:
         Why integer-valued projections at init: the int8 regime is the default
         deployment state, so the reference starts inside it instead of
         describing it from the outside. Scales are folded into the readout.
+
+        The stream is keyed by ``head_index`` as well as the shape. Keying on
+        shape alone gave every head of a layer the same stream, so the four
+        "independent" memories were byte-identical and stayed that way for the
+        whole forward pass. See :mod:`bhanox.seeding`.
         """
-        rng = np.random.default_rng(abs(hash((self.d_in, self.d_k, self.d_v))) % 2**32)
+        rng = init_rng(self.seed, "head", self.name, self.head_index)
         d = self.d_in
 
         def proj(rows: int, cols: int) -> NDArray[np.floating]:
@@ -195,7 +204,10 @@ class DeltaBankHead:
         # Bank logits initialised to a near-uniform prior over decay rates, so
         # every timescale starts represented and learning refines the mixture.
         self.bank_logits = np.zeros((self.n_banks, self.d_k), dtype=np.float32)
-        self.state = np.zeros((self.d_k, self.d_v), dtype=np.int32)
+        # One sample to start. forward() grows this to the batch it is handed,
+        # so batch-1 callers (step, generate, every invariant check) allocate
+        # exactly what they did before per-sample state existed.
+        self.state = np.zeros((1, self.d_k, self.d_v), dtype=np.int32)
 
     # -- state ---------------------------------------------------------------
 
@@ -207,14 +219,47 @@ class DeltaBankHead:
 
     @property
     def state_nbytes(self) -> int:
-        """int8 bytes of state. Constant in context length.
+        """int8 bytes of state *per sample*, constant in context length.
 
         One byte per element, not ``state.itemsize``: the state holds int8 codes
         and the int32 carrier exists only so the reference's intermediate
         products cannot overflow. The native M4 kernel stores these as int8, and
         this is the number invariant I2 audits.
+
+        Per sample, deliberately: I2 asks what one stream costs, and a batch of
+        ``B`` streams costs ``B`` times this. Reporting the allocation would
+        make the invariant drift with whatever batch size the model last saw,
+        which is not a property of the architecture. Use
+        :attr:`batch_state_nbytes` for what is actually resident.
         """
+        return int(self.d_k * self.d_v)
+
+    @property
+    def batch_state_nbytes(self) -> int:
+        """int8 bytes the state actually occupies, across every live sample."""
         return int(self.state.size)
+
+    def ensure_batch(self, batch: int) -> None:
+        """Grow the state to hold ``batch`` independent streams.
+
+        Args:
+            batch: Number of concurrent samples. Must be at least one.
+
+        Raises:
+            ValueError: If ``batch`` is not positive.
+
+        Why growth is safe: the state is O(1) in context length and O(batch) in
+        batch, and new samples start at zero, which is exactly what a fresh
+        stream's state is. Nothing is copied but the existing rows.
+        """
+        if batch < 1:
+            raise ValueError(f"batch must be >= 1, got {batch}")
+        have = self.state.shape[0]
+        if batch <= have:
+            return
+        grown = np.zeros((batch, self.d_k, self.d_v), dtype=np.int32)
+        grown[:have] = self.state
+        self.state = grown
 
     # -- decay ---------------------------------------------------------------
 
@@ -258,25 +303,44 @@ class DeltaBankHead:
     def forward(
         self, x: NDArray[np.floating], bank_rates: NDArray[np.floating]
     ) -> NDArray[np.floating]:
-        """Advance the state by one token and return the head's output.
+        """Advance every sample's state by one token and return their outputs.
 
         Args:
-            x: Input vector of width ``d_in``.
+            x: ``(B, d_in)`` activations, or a single ``(d_in,)`` vector, which
+                is treated as one sample.
             bank_rates: Decay bank prior, shape ``(n_banks,)``.
 
         Returns:
-            Output vector of width ``d_v``.
+            ``(B, d_v)``, or ``(d_v,)`` if ``x`` was a single vector.
 
         Raises:
             ValueError: If ``x`` has the wrong width.
+
+        Per-sample state: sample ``b`` only ever touches row ``b``. That is the
+        whole point -- before this, ``B`` rows shared one state, so row 1 read
+        what row 0 had written and a batched loss was measuring the wrong thing.
+        Every operation below is integer, and integer addition is associative,
+        so batching cannot change a single bit of the batch-1 result.
         """
-        if x.shape[-1] != self.d_in:
+        arr = np.asarray(x, dtype=np.float32)
+        single = arr.ndim == 1
+        if single:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[-1] != self.d_in:
             raise ValueError(
-                f"DeltaBankHead expected d_in={self.d_in}, got {x.shape[-1]}"
+                f"DeltaBankHead expected d_in={self.d_in} as (B, {self.d_in}) or "
+                f"a single ({self.d_in},) vector, got shape {arr.shape}"
             )
+        batch = arr.shape[0]
+        self.ensure_batch(batch)
+        # Slice, don't just ensure. A model that ran a batch of 32 and is now
+        # handed a batch of 1 still holds 32 state rows, and einsum would
+        # happily broadcast the single query against all of them and hand back
+        # 32 answers for 1 token.
+        state = self.state[:batch]
         # Project, then L2-normalise K and Q (finding 1: mandatory -- without
         # unit-norm keys the delta rule's beta = 1/||k||^2 diverges).
-        k, q, v = x @ self.W_k, x @ self.W_q, x @ self.W_v
+        k, q, v = arr @ self.W_k, arr @ self.W_q, arr @ self.W_v
         if self.normalize_keys:
             k = l2_normalize(k)
             q = l2_normalize(q)
@@ -302,54 +366,67 @@ class DeltaBankHead:
             # each int32 dot product is in 127^2 * r. One integer divide by
             # INT8_MAX brings the surprise back to code units; the real-valued
             # read needs the full 127^2. In the native kernel both are shifts.
-            acc_q = self.state.T @ q8
-            acc_k = self.state.T @ k8
+            acc_q = np.einsum("bkv,bk->bv", state, q8)
+            acc_k = np.einsum("bkv,bk->bv", state, k8)
             e8 = saturate_int8(v8 - acc_k // INT8_MAX)
-            self._write(k8, e8, v8, bank_rates=bank_rates)
+            state = self._write(state, k8, e8, v8, bank_rates=bank_rates)
             r = acc_q / float(INT8_MAX**2)
         else:  # pragma: no cover - reached only by the ordering regression test
             # Write first, then read. Kept because the difference is a
             # regression test, not a configuration anyone should use.
-            self._write(k8, v8, v8, bank_rates=bank_rates)
-            r = (self.state.T @ q8) / float(INT8_MAX**2)
-        self.reads += 1
-        self.writes += 1
+            state = self._write(state, k8, v8, v8, bank_rates=bank_rates)
+            r = np.einsum("bkv,bk->bv", state, q8) / float(INT8_MAX**2)
+        self.state[:batch] = state
+        self.reads += batch
+        self.writes += batch
 
-        if self.use_read_gate:
-            # Read gate (finding 3): +0.037 BPC without it. Per read channel,
-            # before the read-out, so it can suppress a channel the model does
-            # not currently want.
-            return r * _sigmoid(x @ self.W_r)
-        return r
+        # Read gate (finding 3): +0.037 BPC without it. Per read channel,
+        # before the read-out, so it can suppress a channel the model does not
+        # currently want.
+        out = r * _sigmoid(arr @ self.W_r) if self.use_read_gate else r
+        return out[0] if single else out
 
     def _write(
         self,
-        k8: NDArray[np.int32],
-        e8: NDArray[np.int32],
-        v8: NDArray[np.int32],
+        state: NDArray[np.integer],
+        k8: NDArray[np.integer],
+        e8: NDArray[np.integer],
+        v8: NDArray[np.integer],
         *,
         bank_rates: NDArray[np.floating],
-    ) -> None:
+    ) -> NDArray[np.integer]:
         """Apply the delta-rule write plus per-channel decay, in int8 fixed point.
 
         Args:
-            k8: Unit-norm key on the int8 grid, ``(d_k,)``.
-            e8: Surprise ``v - S^T k`` already in code units, ``(d_v,)``.
+            state: The active state rows, ``(B, d_k, d_v)``.
+            k8: Unit-norm keys on the int8 grid, ``(B, d_k)``.
+            e8: Surprise ``v - S^T k`` already in code units, ``(B, d_v)``.
+            v8: Values on the int8 grid, ``(B, d_v)``.
             bank_rates: Decay bank prior.
+
+        Returns:
+            The new state rows. Written back by the caller so a narrower batch
+            cannot clobber rows belonging to other samples.
 
         Every step is one of MUL / SHIFT / SAT / ADD, all whitelisted by I3.
         """
-        lam_q = self.decay_q(bank_rates)  # (d_k,) Q16
-        # beta = LUT_recip[||k||^2] * eta, in Q16. The table is 1-indexed by the
-        # spec's LUT_recip[||k||^2], so ||k||^2 == 1 reads entry 1 == 1.0 and
-        # beta is exactly eta. This is why K L2-normalisation is mandatory
-        # rather than merely tidy.
-        k_sq = float(k8 @ k8) / float(INT8_MAX**2)
-        index = int(min(255, max(1, round(k_sq))))
-        beta_q = to_q(float(_RECIP[index - 1]) * self.eta)
+        lam_q = self.decay_q(bank_rates)  # (d_k,) Q16, shared across samples
+        # beta = LUT_recip[||k||^2] * eta, in Q16, per sample. The table is
+        # 1-indexed by the spec's LUT_recip[||k||^2], so ||k||^2 == 1 reads
+        # entry 1 == 1.0 and beta is exactly eta. This is why K L2-normalisation
+        # is mandatory rather than merely tidy.
+        k_sq = np.einsum("bk,bk->b", k8, k8).astype(np.float64) / float(INT8_MAX**2)
+        index = np.clip(np.rint(k_sq), 1, 255).astype(np.int64)
+        # float64 before the Q16 rounding, deliberately. `_RECIP` is float32 and
+        # NumPy 2 keeps `float32 * python_float` in float32, so the batched form
+        # silently rounds beta at 24 bits and then again at 16. The single-sample
+        # form went through Python's `float()`, which widens first. The two
+        # disagree by 1 in Q16 often enough to flip the gate's hysteresis, and
+        # batch-1 then stops reproducing.
+        beta_q = to_q(_RECIP[index - 1].astype(np.float64) * float(self.eta))[:, None]
         # Diag(lambda) S: decay scales state ROWS (key channels), so it is a
         # left multiplication. Q16 rate against a unit-range state: one shift.
-        decayed = qmul(self.state, lam_q[:, None])
+        decayed = qmul(state, lam_q[None, :, None])
         # "additive" is the ablation baseline: write v k^T with no error term,
         # i.e. plain accumulation. The delta rule's whole argument is that this
         # is worse, and the architecture's T3 measurement (recall 1.000 vs
@@ -364,8 +441,8 @@ class DeltaBankHead:
         # the int8 state range, so it needs the requantisation step every int8
         # GEMM has: divide by INT8_MAX to bring the product back to code units.
         # Without it the state slams into saturation and recall goes to zero.
-        update = (k8[:, None] * scaled_e[None, :]) // INT8_MAX
-        self.state = saturate_int8(decayed + update)
+        update = (k8[:, :, None] * scaled_e[:, None, :]) // INT8_MAX
+        return saturate_int8(decayed + update)
 
     # -- introspection -------------------------------------------------------
 
@@ -373,20 +450,28 @@ class DeltaBankHead:
         """Read the state with a query key, without writing.
 
         Args:
-            k: Query key of width ``d_k``. Normalised internally.
+            k: Query key of width ``d_k``, normalised internally. A ``(d_k,)``
+                vector reads sample 0; a ``(B, d_k)`` block reads one key per
+                sample, each from its own state row.
 
         Returns:
-            The retrieved value, shape ``(d_v,)``, in real units.
+            ``(d_v,)`` for a single key, else ``(B, d_v)``, in real units.
 
         Why the quantise-then-divide: this has to agree with the read inside
         :meth:`forward` to the last bit, and that read is int8 codes against
-        int8 codes. Returning ``state.T @ q`` with a raw unit vector would hand
+        int8 codes. Returning ``state^T q`` with a raw unit vector would hand
         back codes at 127x the intended scale, which looks like a working
         recall and is not one.
         """
-        qn = l2_normalize(np.asarray(k, dtype=np.float32))
+        arr = np.asarray(k, dtype=np.float32)
+        single = arr.ndim == 1
+        if single:
+            arr = arr[None, :]
+        qn = l2_normalize(arr)
         q8 = quantize_activation(qn)
-        return (self.state.T @ q8) / float(INT8_MAX**2)
+        rows = self.state[: arr.shape[0]]
+        out = np.einsum("bkv,bk->bv", rows, q8) / float(INT8_MAX**2)
+        return out[0] if single else out
 
     def memory_accuracy(
         self, keys: NDArray[np.floating], values: NDArray[np.floating]

@@ -43,9 +43,11 @@ test.
 The trainer, the checkpoint format, and the first real weights. This is where
 perplexity becomes a number instead of a `NOT MEASURED`.
 
-It also resolves the open question left by M1: the recurrent state is currently a
-single instance, so `forward(B, T)` is one concatenated stream. Per-sample state
-is required before a batched loss means anything.
+**Done ahead of M2 — per-sample state.** The question M1 left open is closed.
+The recurrent state carries a sample axis, so a batched loss means what it
+says. Batch-1 behaviour is unchanged, measured rather than assumed: same int32
+state, same gate decisions, float32 logits bit-identical. See *Batch semantics*
+in `docs/architecture.md`.
 
 **Done ahead of M2 — spec D7, memory budgets.** Both memories are now explicit,
 bounded, user-settable byte ceilings: `load_config(..., temp_mem=, perm_mem=)`,

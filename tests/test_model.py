@@ -114,28 +114,68 @@ class TestCausality:
 
 
 class TestBatchSemantics:
-    """The state is a single instance, so ``B`` is a throughput knob for the
-    mixer and not a set of independent streams."""
+    """Rows are independent: the state and the gate both carry a sample axis.
 
-    def test_a_batch_is_exactly_one_concatenated_stream(self, model: Bhanox) -> None:
+    This class used to pin the opposite. It read:
+
+        The state is a single instance, so ``B`` is a throughput knob for the
+        mixer and not a set of independent streams.
+        ... so nobody later 'fixes' it into a silent per-sample state and
+        changes every number measured against it.
+
+    That warning was honoured rather than ignored: M2 made the change
+    deliberately, in the open, and the second half of it turned out to be free.
+    Every measurement in ``docs/benchmarks.md`` was taken at batch 1, and batch-1
+    results are bit-identical before and after, because the recurrence is
+    integer arithmetic and integer addition is associative. Nothing moved.
+    """
+
+    def test_a_row_is_independent_of_its_neighbours(self, model: Bhanox) -> None:
         a = np.array([3, 9, 14, 22], np.int64)
         b = np.array([31, 40, 7, 19], np.int64)
         model.reset()
         batched = model.forward(np.stack([a, b]))
         model.reset()
-        stream = model.forward(np.concatenate([a, b]))
-        assert np.allclose(batched[0], stream[0, :4])
-        assert np.allclose(batched[1], stream[0, 4:])
+        alone = model.forward(b)
+        # Not array_equal, and deliberately so: a (2, d) matmul and a (1, d)
+        # matmul sum in a different order in float32, so bit-equality across
+        # batch sizes is not a property any float library offers. The
+        # tolerance is relative to the signal, not absolute.
+        assert np.allclose(batched[1], alone[0], rtol=1e-5, atol=1e-5)
 
-    def test_a_row_sees_the_rows_before_it(self, model: Bhanox) -> None:
-        """Pins the shared-state semantics, so nobody later 'fixes' it into a
-        silent per-sample state and changes every number measured against it."""
+    def test_the_recurrent_state_is_exactly_per_sample(self, model: Bhanox) -> None:
+        """The float read-out drifts; the memory itself must not.
+
+        This is the assertion that actually matters. The DeltaBank state is
+        int32, so if sample ``b`` read anything sample ``a`` wrote, the arrays
+        differ by a whole number rather than by float32 rounding.
+        """
+        head = model.deltabanks[0].heads[0]
         ids = np.array([3, 9, 14, 22, 31, 40], np.int64)
+        other = np.full(6, 7, np.int64)
+        model.reset()
+        model.forward(ids)
+        solo = head.state[0].copy()
+        model.reset()
+        # `ids` must be the *second* row: row 0 is the neighbour it has to be
+        # immune to.
+        model.forward(np.stack([other, ids]))
+        assert np.array_equal(solo, head.state[1])
+
+    def test_a_row_no_longer_sees_the_rows_before_it(self, model: Bhanox) -> None:
+        """The old semantics, asserted in reverse.
+
+        This used to read "pins the shared-state semantics, so nobody later
+        'fixes' it". Now it pins the fix: a row must not reach the rows after
+        it, which is the whole reason a batched loss means anything.
+        """
+        ids = np.array([3, 9, 14, 22], np.int64)
+        junk = np.array([99, 98, 97, 96], np.int64)
         model.reset()
         alone = model.forward(ids)[0]
         model.reset()
-        preceded = model.forward(np.concatenate([np.array([99, 99]), ids]))[0]
-        assert not np.allclose(alone, preceded[2:])
+        batched = model.forward(np.stack([junk, ids]))
+        assert np.allclose(alone, batched[1], rtol=1e-5, atol=1e-5)
 
     def test_batch_size_one_is_the_reference(self, model: Bhanox) -> None:
         ids = np.array([5, 6, 7, 8], np.int64)

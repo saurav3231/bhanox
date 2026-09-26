@@ -33,6 +33,7 @@ from numpy.typing import NDArray
 
 from bhanox.config import BhanoxConfig
 from bhanox.quant.numerics import absmax_quantize
+from bhanox.seeding import init_rng
 
 __all__ = ["MicroExpertLayer", "gelu_lut", "top2_balanced"]
 
@@ -137,6 +138,7 @@ class MicroExpertLayer:
     """
 
     config: BhanoxConfig
+    layer_index: int = 0
     E: NDArray[np.floating] = field(init=False)
     b: NDArray[np.floating] = field(init=False)
     W1: NDArray[np.floating] = field(init=False)
@@ -147,7 +149,7 @@ class MicroExpertLayer:
     def __post_init__(self) -> None:
         """Allocate router and expert weights in the int8 regime."""
         cfg = self.config
-        rng = np.random.default_rng(abs(hash(("moe", cfg.name))) % 2**32)
+        rng = init_rng(cfg.seed, "moe", cfg.name, self.layer_index)
         n = cfg.total_experts
 
         def stack(rows: int, cols: int) -> NDArray[np.float32]:

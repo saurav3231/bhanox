@@ -65,6 +65,13 @@ class BhanoxConfig:
         n_hashes: Independent hash functions per token.
         max_context: Positional window for the recurrent state. The state does
             not grow with it (O(1) generation, spec A2/goal 3).
+        seed: Seed for weight initialisation. Every projection derives its own
+            stream from ``(seed, site, name)``, so the streams cannot collide
+            and the whole model is reproducible across processes. This is
+            recorded in the checkpoint header. It used to be
+            ``abs(hash((site, name)))``, and ``hash()`` on a str is randomised
+            per process, so the read-out, bypass, unembed and MoE weights were
+            silently different on every run.
         l2_bytes: L2 budget used by the I2 audit. Not a model parameter.
         temp_mem_bytes: Spec-D7 budget for the DeltaBank working state. ``None``
             means "whatever the shape needs". Not user-resizable: the state is
@@ -92,6 +99,7 @@ class BhanoxConfig:
     pool_size: int = 8192
     n_hashes: int = 4
     max_context: int = 4096
+    seed: int = 0
     l2_bytes: int = L2_BYTES
     temp_mem_bytes: int | None = None
     perm_mem_bytes: int | None = None

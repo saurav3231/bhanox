@@ -22,6 +22,7 @@ from numpy.typing import NDArray
 from bhanox.config import BhanoxConfig
 from bhanox.core.deltabank import DeltaBankHead
 from bhanox.quant.numerics import absmax_quantize
+from bhanox.seeding import init_rng
 
 __all__ = ["DeltaBankLayer"]
 
@@ -66,12 +67,17 @@ class DeltaBankLayer:
                 d_v=cfg.d_v,
                 d_in=cfg.d_model,
                 n_banks=cfg.n_banks,
+                seed=cfg.seed,
+                name=cfg.name,
+                # Without this every head drew the same stream and the layer
+                # shipped four copies of one memory. See bhanox.seeding.
+                head_index=h,
             )
-            for _ in range(cfg.n_heads)
+            for h in range(cfg.n_heads)
         ]
-        rng = np.random.default_rng(abs(hash(("db", cfg.name))) % 2**32)
 
-        def q(rows: int, cols: int) -> NDArray[np.floating]:
+        def q(rows: int, cols: int, site: str) -> NDArray[np.floating]:
+            rng = init_rng(cfg.seed, site, cfg.name)
             w = rng.standard_normal((rows, cols)) / np.sqrt(rows)
             # Dequantized, not the raw int8 codes. The codes are +/-127, so a
             # float matmul against them makes the read-out about 500x larger
@@ -80,36 +86,51 @@ class DeltaBankLayer:
             # the scale downstream, which is exactly why it went unnoticed.
             return absmax_quantize(w, axis=0).dequantize().astype(np.float32)
 
-        self.W_o = q(cfg.n_heads * cfg.d_v, cfg.d_model)
-        self.G = q(cfg.d_model, cfg.d_model)
+        self.W_o = q(cfg.n_heads * cfg.d_v, cfg.d_model, "db.readout")
+        self.G = q(cfg.d_model, cfg.d_model, "db.bypass")
 
     def reset(self) -> None:
         """Reset every head."""
         for head in self.heads:
             head.reset()
 
+    def ensure_batch(self, batch: int) -> None:
+        """Grow every head's state to hold ``batch`` independent streams."""
+        for head in self.heads:
+            head.ensure_batch(batch)
+
     def forward(self, x: NDArray[np.floating]) -> NDArray[np.floating]:
         """Run one token through every head, then read out and add the bypass.
 
         Args:
-            x: Input vector of width ``d_model``.
+            x: ``(B, d_model)`` activations, or a single ``(d_model,)`` vector,
+                which is treated as one sample.
 
         Returns:
-            Vector of width ``d_model`` -- the layer's contribution to the
-            residual stream.
+            ``(B, d_model)`` -- the layer's contribution to the residual stream
+            -- or ``(d_model,)`` for a single vector.
 
         Raises:
             ValueError: If ``x`` has the wrong width.
         """
-        if x.shape[-1] != self.config.d_model:
+        arr = np.asarray(x, dtype=np.float32)
+        if arr.shape[-1] != self.config.d_model:
             raise ValueError(
                 f"DeltaBankLayer expected d_model={self.config.d_model}, "
-                f"got {x.shape[-1]}"
+                f"got {arr.shape[-1]}"
             )
+        single = arr.ndim == 1
+        if single:
+            arr = arr[None, :]
+        self.ensure_batch(arr.shape[0])
         reads = np.concatenate(
-            [h.forward(x, self.bank_rates) for h in self.heads], axis=-1
+            [h.forward(arr, self.bank_rates) for h in self.heads], axis=-1
         )
-        return reads @ self.W_o + self.G @ x
+        # `reads @ W_o` is (B, n_heads*d_v) @ (n_heads*d_v, d_model). The bypass
+        # is a left multiply for a single vector and a right multiply for a
+        # batch, because the row-vector convention flips.
+        out = reads @ self.W_o + arr @ self.G.T
+        return out[0] if single else out
 
     @property
     def state_nbytes(self) -> int:

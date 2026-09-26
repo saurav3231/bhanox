@@ -51,9 +51,10 @@ class PulseGate:
         salience_frac: Fraction of highest-magnitude channels that never sleep.
         salience: Per-channel gate magnitude used to pick the protected set,
             shape ``(n_channels,)``.
-        cached: Last computed value per channel, shape ``(n_channels,)``.
-        awake: Whether each channel is currently computing, ``(n_channels,)``.
+        cached: Last computed value per channel, shape ``(B, n_channels)``.
+        awake: Whether each channel is currently computing, ``(B, n_channels)``.
         _quiet: Consecutive-quiet counter per channel.
+        _has_run: Whether each sample has computed anything yet, ``(B,)``.
         events: Lifetime count of {wake, sleep, compute, skip} transitions.
     """
 
@@ -66,6 +67,7 @@ class PulseGate:
     cached: NDArray[np.floating] = field(init=False)
     awake: NDArray[np.bool_] = field(init=False)
     _quiet: NDArray[np.int64] = field(init=False)
+    _has_run: NDArray[np.bool_] = field(init=False)
     events: dict[str, int] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -84,12 +86,34 @@ class PulseGate:
         self.tau_hi = np.ones(n, dtype=np.float32)
         self.tau_lo = np.full(n, 0.25, dtype=np.float32)
         self.salience = np.zeros(n, dtype=np.float32)
-        self.cached = np.zeros(n, dtype=np.float32)
-        self.awake = np.ones(n, dtype=bool)
-        self._quiet = np.zeros(n, dtype=np.int64)
+        self.cached = np.zeros((1, n), dtype=np.float32)
+        self.awake = np.ones((1, n), dtype=bool)
+        self._quiet = np.zeros((1, n), dtype=np.int64)
+        self._has_run = np.zeros(1, dtype=bool)
         self.events = {"compute": 0, "skip": 0, "wake": 0, "sleep": 0}
 
     # -- state ---------------------------------------------------------------
+
+    def ensure_batch(self, batch: int) -> None:
+        """Grow the per-channel state to hold ``batch`` independent samples.
+
+        Raises:
+            ValueError: If ``batch`` is not positive.
+        """
+        if batch < 1:
+            raise ValueError(f"batch must be >= 1, got {batch}")
+        have = self.awake.shape[0]
+        if batch <= have:
+            return
+        pad = batch - have
+        self.cached = np.concatenate(
+            [self.cached, np.zeros((pad, self.n_channels), np.float32)]
+        )
+        self.awake = np.concatenate([self.awake, np.ones((pad, self.n_channels), bool)])
+        self._quiet = np.concatenate(
+            [self._quiet, np.zeros((pad, self.n_channels), np.int64)]
+        )
+        self._has_run = np.concatenate([self._has_run, np.zeros(pad, bool)])
 
     def flush(self) -> None:
         """Wake every channel and drop the cached values.
@@ -97,11 +121,18 @@ class PulseGate:
         Use at any boundary where staleness is not acceptable: a document
         boundary, a context reset, or the end of a chunk. This is the
         documented escape hatch; there is no other hidden reset.
+
+        ``_has_run`` is cleared too, and it has to be. It exists to force a
+        never-computed channel to compute on sight, so a gate that carried the
+        flag across a flush would never warm up again for the rest of the
+        process -- a fresh sequence would start from hysteresis left over from
+        a sequence that is over.
         """
+        self.events["wake"] += int(np.count_nonzero(~self.awake))
         self.awake.fill(True)
         self.cached.fill(0.0)
         self._quiet.fill(0)
-        self.events["wake"] += int(self.n_channels)
+        self._has_run.fill(False)
 
     def reset_stats(self) -> None:
         """Zero the lifetime counters, keeping thresholds and cached state."""
@@ -116,52 +147,77 @@ class PulseGate:
         """Advance the gate by one token; return which channels must compute.
 
         Args:
-            a: New input per channel, shape ``(n_channels,)``.
+            a: New input per channel, shape ``(B, n_channels)`` or
+                ``(n_channels,)`` for a single sample.
             gate_magnitude: Per-channel importance, same shape. The top
                 ``salience_frac`` are protected and never sleep.
 
         Returns:
-            Boolean mask, ``True`` where the channel must be recomputed.
+            Boolean mask shaped like ``a``, ``True`` where the channel must be
+            recomputed.
 
         Raises:
             ValueError: On a shape mismatch.
-        """
-        a = np.asarray(a, dtype=np.float32).reshape(-1)
-        if a.size != self.n_channels:
-            raise ValueError(
-                f"PulseGate expected {self.n_channels} channels, got {a.size}"
-            )
-        mag = np.abs(np.asarray(gate_magnitude, dtype=np.float32).reshape(-1))
-        protected = self._protected(mag)
-        delta = np.abs(a - self.cached)
 
-        was_asleep = ~self.awake
+        Per-sample state: the cached value, the awake mask, and the quiet
+        counter all carry a sample axis, so sample ``b``'s hysteresis cannot see
+        what sample ``b'`` fed it. The protected set is chosen within each row,
+        not across the batch -- protecting the globally largest magnitudes would
+        couple the samples through the gate.
+        """
+        arr = np.asarray(a, dtype=np.float32)
+        single = arr.ndim == 1
+        if single:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[1] != self.n_channels:
+            raise ValueError(
+                f"PulseGate expected (B, {self.n_channels}) channels or a single "
+                f"({self.n_channels},) vector, got shape {np.asarray(a).shape}"
+            )
+        mag = np.abs(np.asarray(gate_magnitude, dtype=np.float32))
+        if mag.ndim == 1:
+            mag = mag[None, :]
+        if mag.shape != arr.shape:
+            raise ValueError(
+                f"gate_magnitude shape {mag.shape} does not match input {arr.shape}"
+            )
+        self.ensure_batch(arr.shape[0])
+        protected = self._protected(mag)
+        delta = np.abs(arr - self.cached[: arr.shape[0]])
+
+        was_asleep = ~self.awake[: arr.shape[0]]
         # Wake on a big change, or if this channel is protected (protected
         # channels are never allowed to be asleep in the first place).
         wake = (delta > self.tau_hi) | protected
-        self.awake |= wake
+        awake = self.awake[: arr.shape[0]] | wake
+        self.awake[: arr.shape[0]] = awake
         self.events["wake"] += int(np.count_nonzero(wake & was_asleep))
 
         # Fall asleep after `sleep_after` consecutive quiet steps.
         quiet = delta < self.tau_lo
-        self._quiet = np.where(quiet, self._quiet + 1, 0)
-        sleep = (self._quiet >= self.sleep_after) & ~protected & self.awake
-        self.awake &= ~sleep
+        self._quiet[: arr.shape[0]] = np.where(
+            quiet, self._quiet[: arr.shape[0]] + 1, 0
+        )
+        sleep = (self._quiet[: arr.shape[0]] >= self.sleep_after) & ~protected & awake
+        awake = awake & ~sleep
+        self.awake[: arr.shape[0]] = awake
         self.events["sleep"] += int(np.count_nonzero(sleep))
 
         # A channel that has never been computed must compute now, whatever
-        # the thresholds say.
-        if self.events["compute"] == 0:
-            compute = np.ones(self.n_channels, dtype=bool)
-        else:
-            compute = self.awake.copy()
-        self.cached = np.where(compute, a, self.cached)
+        # the thresholds say. Tracked per sample, so a fresh row in a batch is
+        # not held to whatever the other rows have already done.
+        has_run = self._has_run[: arr.shape[0]]
+        compute = np.where(has_run[:, None], awake, True)
+        self._has_run[: arr.shape[0]] = True
+        self.cached[: arr.shape[0]] = np.where(
+            compute, arr, self.cached[: arr.shape[0]]
+        )
         self.events["compute"] += int(np.count_nonzero(compute))
         self.events["skip"] += int(np.count_nonzero(~compute))
-        return compute
+        return compute[0] if single else compute
 
     def _protected(self, magnitude: NDArray[np.floating]) -> NDArray[np.bool_]:
-        """Mark exactly the top ``salience_frac`` channels as never-skip.
+        """Mark exactly the top ``salience_frac`` channels of each row as never-skip.
 
         Exactly, because a ``>= cutoff`` threshold over-protects whenever the
         magnitudes tie -- and an all-zero salience vector, which is a perfectly
@@ -170,10 +226,11 @@ class PulseGate:
         """
         n_protect = round(self.salience_frac * self.n_channels)
         if n_protect <= 0:
-            return np.zeros(self.n_channels, dtype=bool)
-        top = np.argsort(magnitude, kind="stable")[self.n_channels - n_protect :]
-        out = np.zeros(self.n_channels, dtype=bool)
-        out[top] = True
+            return np.zeros(magnitude.shape, dtype=bool)
+        order = np.argsort(magnitude, axis=-1, kind="stable")
+        top = order[..., self.n_channels - n_protect :]
+        out = np.zeros(magnitude.shape, dtype=bool)
+        np.put_along_axis(out, top, True, axis=-1)
         return out
 
     # -- reporting -----------------------------------------------------------

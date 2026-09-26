@@ -80,7 +80,9 @@ def recall_error(
         if head.normalize_keys:
             k = k / max(float(np.linalg.norm(k)), 1e-6)
         k8 = np.rint(k * INT8_MAX).astype(np.int32)
-        got = (head.state.T @ k8) / float(INT8_MAX**2)
+        # `state[0]`: the state is (B, d_k, d_v) since M2, and these probes
+        # train a single stream, so sample 0 is the one under test.
+        got = (head.state[0].T @ k8) / float(INT8_MAX**2)
         errs.append(float(np.abs(got - w).max()))
     return float(np.mean(errs))
 

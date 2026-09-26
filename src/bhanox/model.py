@@ -37,6 +37,7 @@ from bhanox.governor.pulsegate import PulseGate
 from bhanox.memory.vectorvault import VectorVault
 from bhanox.mixer.microexpert import MicroExpertLayer
 from bhanox.quant.numerics import absmax_quantize
+from bhanox.seeding import init_rng
 
 __all__ = ["Bhanox", "layer_norm"]
 
@@ -56,7 +57,7 @@ def _init_output(cfg: BhanoxConfig) -> NDArray[np.float32]:
     The scale is ``1/sqrt(d_model)`` so that multiplying a unit-RMS residual by
     it yields a comparable-magnitude logit rather than a huge or vanishing one.
     """
-    rng = np.random.default_rng(abs(hash(("unembed", cfg.name))) % 2**32)
+    rng = init_rng(cfg.seed, "unembed", cfg.name)
     w = rng.standard_normal((cfg.d_model, cfg.output_vocab)) / np.sqrt(cfg.d_model)
     return absmax_quantize(w, axis=-1).dequantize().astype(np.float32)
 
@@ -154,7 +155,12 @@ class Bhanox:
             n_hashes=cfg.n_hashes,
         )
         self.deltabanks = [DeltaBankLayer(cfg) for _ in range(cfg.n_layers)]
-        self.mixers = [MicroExpertLayer(cfg) for _ in range(cfg.n_layers)]
+        # The index matters: keyed on shape alone, every layer drew the same
+        # stream and the stack was n_layers copies of one block. See
+        # bhanox.seeding.
+        self.mixers = [
+            MicroExpertLayer(cfg, layer_index=i) for i in range(cfg.n_layers)
+        ]
         self.gates = [PulseGate(cfg.d_model) for _ in range(cfg.n_layers)]
         self.output = _init_output(cfg)
         if cfg.use_vault:
@@ -306,13 +312,26 @@ class Bhanox:
         Raises:
             ValueError: If the context is longer than ``config.max_context``.
 
-        Warning:
-            The recurrent state is a *single* instance, so ``B`` rows are not
-            independent. Row 0 is processed, then row 1 against the state row 0
-            left behind, and so on: ``forward(stack([a, b]))`` is identical to
-            ``forward(concatenate([a, b]))``. Batching therefore buys nothing for
-            the memory path -- it is the mixer that vectorises. Per-sample state
-            is an M2 concern; do not assume row independence in a loss.
+        Note:
+            Rows are independent. The DeltaBank state and the PulseGate state
+            both carry a sample axis, so sample ``b`` reads only what sample
+            ``b`` wrote.
+
+            Two different claims, and the difference matters. The recurrent
+            *state* is int32, so ``forward(stack([a, b]))[1]`` and
+            ``forward(b)[0]`` leave states that compare equal with ``==``. The
+            *logits* are float32 and come out of a matmul over a ``(B, T)``
+            block, so they are equal only to rounding -- BLAS sums a batched
+            product in a different order than a single-row one. Compare
+            logits with ``allclose``; compare state with ``array_equal``.
+
+            This was not true before M2. The state was a single instance, so
+            ``forward(stack([a, b]))`` equalled
+            ``forward(concatenate([a, b]))`` and a batched loss measured the
+            wrong thing. Batch-1 behaviour is unchanged by the refactor --
+            measured, not assumed: same int32 state, same gate decisions, and
+            float32 logits bit-identical (``max|diff| == 0.0``) on the nano
+            config. See ``docs/architecture.md``.
         """
         arr = np.asarray(ids)
         if arr.ndim == 1:
@@ -350,17 +369,19 @@ class Bhanox:
         Returns:
             ``(B, T, d_model)`` memory contribution.
 
-        Why the batch loop is outside the time loop: the state and the gate are
-        single instances, so the only ordering that is well defined is row 0
-        fully, then row 1, and so on. See the warning on :meth:`forward`.
+        Why the time loop is outside the batch loop's shadow: the state is
+        ``(B, d_k, d_v)``, one row per sample, so sample ``b`` only ever reads
+        what sample ``b`` wrote. The time loop stays outermost because the
+        recurrence is sequential in ``t`` -- there is nothing to vectorise
+        across it -- but the batch is now real rather than a throughput knob
+        for the mixer alone.
         """
         batch, seq, _ = x.shape
         out = np.zeros((batch, seq, gate.n_channels), dtype=np.float32)
-        for b in range(batch):
-            for t in range(seq):
-                step_out = bank.forward(x[b, t])
-                compute = gate.step(step_out, np.abs(step_out))
-                out[b, t] = np.where(compute, step_out, 0.0)
+        for t in range(seq):
+            step_out = bank.forward(x[:, t])
+            compute = gate.step(step_out, np.abs(step_out))
+            out[:, t] = np.where(compute, step_out, 0.0)
         return out
 
     def step(self, ids: NDArray[np.integer] | np.integer) -> NDArray[np.float32]:

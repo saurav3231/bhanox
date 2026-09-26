@@ -33,9 +33,21 @@ def unit() -> np.ndarray:
     return np.full(N, 1.0, dtype=np.float32)
 
 
+def row(state: np.ndarray) -> np.ndarray:
+    """The one stream's row of a ``(B, n_channels)`` gate state.
+
+    Since M2 the gate carries a sample axis, so ``cached``, ``awake`` and
+    ``_quiet`` are all ``(B, n_channels)``. Every test in this file drives a
+    single stream, so the batch axis is always 1; reading through this helper
+    keeps the assertions about behaviour instead of about layout.
+    """
+    assert state.shape[0] == 1, "these tests drive a single stream"
+    return state[0]
+
+
 class TestConstruction:
     def test_starts_fully_awake(self) -> None:
-        assert gate().awake.all()
+        assert row(gate().awake).all()
 
     def test_untrained_gate_skips_nothing(self) -> None:
         """An untrained gate must behave exactly like an ungated one."""
@@ -64,20 +76,20 @@ class TestStep:
         g = gate()
         a = np.arange(N, dtype=np.float32)
         g.step(a, unit())
-        assert np.array_equal(g.cached, a)
+        assert np.array_equal(row(g.cached), a)
 
     def test_identical_input_eventually_sleeps(self) -> None:
         g = gate()
         a = np.full(N, 5.0, dtype=np.float32)
         for _ in range(4):
             g.step(a, unit())
-        assert not g.awake.any()
+        assert not row(g.awake).any()
 
     def test_big_change_wakes_a_sleeping_channel(self) -> None:
         g = gate()
         for _ in range(4):
             g.step(np.full(N, 5.0, dtype=np.float32), unit())
-        assert not g.awake.any()
+        assert not row(g.awake).any()
         assert g.step(np.full(N, 50.0, dtype=np.float32), unit()).all()
 
     def test_hysteresis_holds_a_channel_asleep_in_the_gap(self) -> None:
@@ -88,11 +100,11 @@ class TestStep:
         base = np.full(N, 5.0, dtype=np.float32)
         for _ in range(4):
             g.step(base, unit())
-        assert not g.awake.any()
+        assert not row(g.awake).any()
         nudge = base + 0.5  # above tau_lo=0.25, below tau_hi=1.0
         out = g.step(nudge, unit())
         assert not out.any()
-        assert not g.awake.any()
+        assert not row(g.awake).any()
 
     def test_sleep_requires_consecutive_quiet_steps(self) -> None:
         g = gate(sleep_after=3)
@@ -102,11 +114,11 @@ class TestStep:
         for i in range(2):
             g.step(b, unit())
             if i < 2:
-                assert g.awake.all(), f"woke too early at step {i}"
+                assert row(g.awake).all(), f"woke too early at step {i}"
         g.step(b, unit())
         g.step(b, unit())
         g.step(b, unit())
-        assert not g.awake.any()
+        assert not row(g.awake).any()
 
     def test_noisy_channel_never_sleeps(self) -> None:
         """The other half of the pinned operating point: 0% skipped.
@@ -128,7 +140,7 @@ class TestStep:
         for _ in range(6):
             out = g.step(np.full(N, 5.0, dtype=np.float32), mag)
         assert out[0]
-        assert g.awake[0]
+        assert row(g.awake)[0]
 
     def test_protection_count_is_exact_under_ties(self) -> None:
         """An all-zero salience vector must not protect every channel, which is
@@ -149,23 +161,23 @@ class TestState:
         g = gate()
         for _ in range(4):
             g.step(np.full(N, 5.0, dtype=np.float32), unit())
-        assert not g.awake.any()
+        assert not row(g.awake).any()
         g.flush()
-        assert g.awake.all()
+        assert row(g.awake).all()
         assert g.step(np.full(N, 5.0, dtype=np.float32), unit()).all()
 
     def test_flush_drops_the_cache(self) -> None:
         g = gate()
         g.step(np.full(N, 5.0, dtype=np.float32), unit())
         g.flush()
-        assert not g.cached.any()
+        assert not row(g.cached).any()
 
     def test_reset_stats_keeps_state(self) -> None:
         g = gate()
         g.step(zeros(), unit())
         g.reset_stats()
         assert g.events["compute"] == 0
-        assert g.awake.all()
+        assert row(g.awake).all()
 
 
 class TestReporting:

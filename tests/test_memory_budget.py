@@ -281,6 +281,25 @@ class TestPermBudget:
         assert report["perm"]["budget_bytes"] == 256 * 1024
         assert report["perm"]["entry_limit"] == 256 * 1024 // model.vault.entry_bytes
 
+    def test_per_entry_cost_is_measured_not_arithmetic(self) -> None:
+        """Per-entry bytes come from the allocator, never from a hand sum.
+
+        The key is 1,024 B for every preset, so the per-entry cost *looks* like
+        a constant. It is not: the value term is 4*d_model, and d_model runs
+        128/256/512 across nano/mini/small, so the value is a third to two
+        thirds of an entry. Quoting bytes-per-entry off the key alone undercounts
+        mini by 44% -- 1,152 B, which also quietly drops the 12 B of
+        bookkeeping. 2,060 B is the real number, and only the arrays know it.
+        """
+        for name in ("nano", "mini", "small"):
+            cfg = load_config(name)
+            vault = VectorVault(n_slots=64, d_value=cfg.d_model)
+            assert vault.nbytes == 64 * perm_entry_bytes(8192, cfg.d_model)
+            assert vault.entry_bytes == vault.nbytes // 64
+        # The two figures that started this, pinned so neither drifts.
+        assert perm_entry_bytes(8192, 256) == 2060  # mini
+        assert perm_entry_bytes(8192, 32) == 1164  # not 1,152
+
     def test_a_config_budget_tighter_than_one_entry_is_honoured(self) -> None:
         """Construction must not blow up on a budget the vault cannot use."""
         model = Bhanox(load_config("nano", perm_mem="8B"))
