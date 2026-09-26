@@ -34,7 +34,7 @@ from bhanox.config import (
 )
 from bhanox.frontend.hashbind import HashBind, encode_bytes
 from bhanox.generate import generate
-from bhanox.model import Bhanox
+from bhanox.model import Bhanox, MemoryReport, PermSection, TempSection
 
 __version__ = "0.1.0"
 
@@ -51,6 +51,7 @@ __all__ = [
     "frontend",
     "generate",
     "load_config",
+    "memory_report",
     "register_preset",
     "report",
 ]
@@ -95,6 +96,52 @@ def report(model: Bhanox) -> str:
         "",
         residency.summary(),
     ]
+    return "\n".join(lines)
+
+
+def memory_report(model: Bhanox, *, as_text: bool = True) -> str | MemoryReport:
+    """Print (or return) each memory's bytes against its budget.
+
+    Spec D7. This is the user-facing view of the two byte budgets: the
+    DeltaBank's temporary working state and the VectorVault's permanent store.
+
+    Args:
+        model: The model to describe.
+        as_text: Print a table and return it. Set False to get the typed report,
+            which is what the tests assert on.
+
+    Returns:
+        The formatted report, or a :class:`bhanox.model.MemoryReport` when
+        ``as_text`` is False.
+    """
+    data = model.memory_report()
+    if not as_text:
+        return data
+    lines = [
+        f"Memory report -- config={data['config']} (spec D7 byte budgets)",
+        f"  {'memory':<6} {'in use':>12} {'budget':>12}  {'within':<7} note",
+    ]
+
+    def row(label: str, section: TempSection | PermSection, note: str) -> str:
+        budget = section["budget_human"]
+        return (
+            f"  {label:<6} {section['used_human']:>12} "
+            f"{'uncapped' if budget is None else budget:>12}  "
+            f"{section['within_budget']!s:<7} {note}"
+        )
+
+    lines.append(row("temp", data["temp"], "fixed by the trained weights"))
+    perm = data["perm"]
+    if perm is None:
+        lines.append("  perm   no vault (use_vault=False)")
+    else:
+        note = (
+            f"{perm['entries']}/{perm['entry_limit']} entries, "
+            f"{perm['reserved_bytes']:,} B reserved"
+        )
+        lines.append(row("perm", perm, note))
+    for warning in data["warnings"]:
+        lines.append(f"  ! {warning}")
     return "\n".join(lines)
 
 

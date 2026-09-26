@@ -24,10 +24,12 @@ under the default regime; it is not a floating-point op in the deployed graph.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
 
+from bhanox.budgets import format_bytes
 from bhanox.config import BhanoxConfig
 from bhanox.core.deltabank_layer import DeltaBankLayer
 from bhanox.frontend.hashbind import HashBind
@@ -80,6 +82,39 @@ def layer_norm(x: NDArray[np.floating], eps: float = 1e-5) -> NDArray[np.floatin
     return (centred / np.sqrt(var + eps)).astype(np.float32)
 
 
+class TempSection(TypedDict):
+    """The DeltaBank working state against its budget."""
+
+    used_bytes: int
+    budget_bytes: int | None
+    used_human: str
+    budget_human: str | None
+    within_budget: bool
+    adjustable: bool
+
+
+class PermSection(TypedDict):
+    """The VectorVault against its budget."""
+
+    used_bytes: int
+    budget_bytes: int | None
+    used_human: str
+    budget_human: str | None
+    within_budget: bool
+    entries: int
+    entry_limit: int
+    reserved_bytes: int
+
+
+class MemoryReport(TypedDict):
+    """Both memories' budgets, as `bhanox.memory_report` returns them."""
+
+    config: str
+    temp: TempSection
+    perm: PermSection | None
+    warnings: list[str]
+
+
 @dataclass
 class Bhanox:
     """A Bhanox model: front-end plus a stack of memory+sparse-FFN layers.
@@ -124,6 +159,11 @@ class Bhanox:
         self.output = _init_output(cfg)
         if cfg.use_vault:
             self.vault = VectorVault(d_value=cfg.d_model)
+            # A budget passed to load_config has to reach the vault here, or the
+            # config would accept "2GB", turn the vault on, and then run it
+            # uncapped -- which is the silent-discard failure D7 forbids.
+            if cfg.perm_mem_bytes is not None:
+                self.vault.set_budget(cfg.perm_mem_bytes)
 
     # -- parameters ----------------------------------------------------------
 
@@ -145,6 +185,90 @@ class Bhanox:
     def packed_nbytes(self) -> int:
         """int8 bytes of parameters, i.e. the checkpoint size."""
         return self.param_count()
+
+    # -- memory budgets (spec D7) ---------------------------------------------
+
+    def set_perm_budget(self, budget: str | int | None) -> None:
+        """Resize the permanent store's byte budget, live.
+
+        The one Bhanox memory a caller can resize while the model runs. Lowering
+        it below what is already stored truncates the vault by importance
+        score; it never raises, because running out of room must cost recall
+        rather than the process. Raising it lets the vault admit again.
+
+        Args:
+            budget: ``"4GB"``, an int, or ``None`` to lift the cap.
+
+        Raises:
+            ValueError: If the model has no vault, or the budget cannot be
+                parsed or is too small for one entry.
+        """
+        if self.vault is None:
+            raise ValueError(
+                f"{self.config.name}: no VectorVault, so there is no permanent "
+                "store to budget. Build the model with use_vault=True."
+            )
+        self.vault.set_budget(budget)
+        self.config = self.config.with_memory_budgets(perm_mem=budget)
+
+    def memory_report(self) -> MemoryReport:
+        """Bytes held by each memory against its budget, plus the verdict.
+
+        Returns:
+            A :class:`MemoryReport`. ``perm`` is ``None`` when the model has no
+            vault. ``warnings`` lists any budget that is exceeded.
+
+        Why a typed structure and not a string: a report you cannot assert on is
+        decoration. ``bhanox.memory_report`` prints it; tests read the same
+        object.
+        """
+        warnings: list[str] = []
+        required = self.config.required_temp_bytes()
+        temp_budget = self.config.temp_mem_bytes
+        temp_ok = temp_budget is None or required <= temp_budget
+        if temp_budget is not None and not temp_ok:
+            warnings.append(
+                f"temp memory needs {format_bytes(required)} but the budget is "
+                f"{format_bytes(temp_budget)}. This is not adjustable: the state "
+                "is fixed by the trained weights. Raise temp_mem or train a "
+                "narrower model."
+            )
+        temp: TempSection = {
+            "used_bytes": required,
+            "budget_bytes": temp_budget,
+            "used_human": format_bytes(required),
+            "budget_human": (
+                None if temp_budget is None else format_bytes(temp_budget)
+            ),
+            "within_budget": temp_ok,
+            "adjustable": False,
+        }
+        perm: PermSection | None = None
+        if self.vault is not None:
+            used = self.vault.used_bytes
+            budget = self.vault.perm_budget_bytes
+            perm_ok = budget is None or used <= budget
+            if budget is not None and not perm_ok:
+                warnings.append(
+                    f"perm memory holds {format_bytes(used)} against a budget of "
+                    f"{format_bytes(budget)}."
+                )
+            perm = {
+                "used_bytes": used,
+                "budget_bytes": budget,
+                "used_human": format_bytes(used),
+                "budget_human": None if budget is None else format_bytes(budget),
+                "within_budget": perm_ok,
+                "entries": self.vault.filled,
+                "entry_limit": self.vault.max_admissible_entries(),
+                "reserved_bytes": self.vault.nbytes,
+            }
+        return {
+            "config": self.config.name,
+            "temp": temp,
+            "perm": perm,
+            "warnings": warnings,
+        }
 
     # -- state ---------------------------------------------------------------
 

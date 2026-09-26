@@ -89,6 +89,60 @@ noise. The reference caches a random projection for bipolar encoding, which is
 about 16 MB at d=512; the M4 native runtime should use a counter-based hash
 instead of materialising it.
 
+## Memory budgets
+
+Both memories are explicit, bounded, user-settable byte budgets. This is the one
+thing a Transformer cannot do to its KV cache and a Mamba cannot do to its
+state, so it is a feature rather than a convenience.
+
+```python
+cfg = bhanox.load_config("mini", temp_mem="64MB", perm_mem="2GB")
+model.set_perm_budget("4GB")        # live; the vault admits or stops admitting
+print(bhanox.memory_report(model))  # bytes in use against each budget
+```
+
+Sizing, as the code actually measures it:
+
+| memory | bytes | notes |
+|---|---|---|
+| TEMP (DeltaBank state) | `n_layers * n_heads * d_k * d_v` | int8, 1 B per cell. nano 8,192 B; mini 131,072 B |
+| PERM (VectorVault) | `n_slots * (bits // 8 + 4 * d_value + 12)` | the hypervector key dominates |
+
+The design-phase spec wrote these as `L * B * 2d` and `E * (2d + 16)`. Both
+undercount the built layout, the second by 14x, because they assume a key is `d`
+wide when it is a hypervector of `bits` bits. A budget check that undercounts is
+worse than no budget, so the formulas above are the ones the code measures and
+`test_temp_matches_the_measured_state` holds them against the real arrays.
+
+What is tied to the trained model, and what is a free knob:
+
+| piece | tied to params | user-settable |
+|---|---|---|
+| `d_k`, `d_v` (state shape) | yes | no |
+| `n_heads` (state area) | yes | no |
+| `n_banks` (decay schedule) | no | config-time, **costs no bytes** |
+| vault entry cap `E` | no | yes, live |
+
+`n_banks` is the one the spec got wrong in the other direction: `L * B * 2d`
+implies buying memory by widening the bank mix, but B only selects decay rates.
+Widen B and the state does not move.
+
+Budgets bound **bytes**, not admissions. The vault allocates its slot table up
+front, so a budget that merely stopped writes would still hold 1.5 MB resident
+while reporting 64 KB. `set_budget` resizes the table, so a 64 KB budget really
+costs 64 KB. Lowering one truncates by the same salience x recency score the
+vault evicts with, so shrinking a budget drops exactly the entries the vault
+would have overwritten anyway. Oversubscribing is legal and warns once;
+undersubscribing never raises, because running out of room must cost recall
+rather than the process.
+
+A budget is a ceiling, not a purchase order. `set_budget("4GB")` does not
+allocate 4 GB: the table is `min(entry_cap, budget limit)`, so the entry cap `E`
+governs how much is really reserved and a loose budget is simply not binding.
+Growing `E` is a separate, deliberate call (`set_entry_cap`), and it refuses to
+drop entries already stored. Widening `n_banks` costs nothing, because it only
+selects decay rates.
+
 ## Batch semantics
 
 The recurrent state is a **single instance**. `forward(B, T)` is therefore

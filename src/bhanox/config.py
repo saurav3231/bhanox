@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from bhanox.budgets import parse_bytes, temp_state_bytes
+
 __all__ = [
     "L2_BYTES",
     "PRESETS",
@@ -64,6 +66,12 @@ class BhanoxConfig:
         max_context: Positional window for the recurrent state. The state does
             not grow with it (O(1) generation, spec A2/goal 3).
         l2_bytes: L2 budget used by the I2 audit. Not a model parameter.
+        temp_mem_bytes: Spec-D7 budget for the DeltaBank working state. ``None``
+            means "whatever the shape needs". Not user-resizable: the state is
+            fixed by the trained weights.
+        perm_mem_bytes: Spec-D7 budget for the VectorVault. ``None`` means
+            uncapped, which is the pre-D7 behaviour. Settable live via
+            ``Bhanox.set_perm_budget``.
     """
 
     name: str = "custom"
@@ -85,6 +93,8 @@ class BhanoxConfig:
     n_hashes: int = 4
     max_context: int = 4096
     l2_bytes: int = L2_BYTES
+    temp_mem_bytes: int | None = None
+    perm_mem_bytes: int | None = None
 
     def __post_init__(self) -> None:
         """Validate shape and invariant I1.
@@ -137,6 +147,64 @@ class BhanoxConfig:
                 "scale (design phase: full-ternary collapses at small scale)"
             )
         self.check_head_load()
+
+    def with_memory_budgets(
+        self,
+        *,
+        temp_mem: str | int | None = None,
+        perm_mem: str | int | None = None,
+    ) -> BhanoxConfig:
+        """Return a copy with the spec-D7 byte budgets applied.
+
+        Frozen dataclass, so this returns a new config rather than mutating.
+        Passing ``None`` for both leaves the config untouched, which is why
+        ``load_config("nano")`` behaves exactly as it did before budgets existed.
+
+        Args:
+            temp_mem: Temporary-state budget, e.g. ``"64MB"``.
+            perm_mem: Permanent-store budget, e.g. ``"2GB"``. Implies
+                ``use_vault=True``, since a budget for a memory that does not
+                exist would otherwise be silently ignored.
+
+        Returns:
+            A config carrying the budgets.
+
+        Raises:
+            ValueError: If a budget cannot be parsed.
+        """
+        if temp_mem is None and perm_mem is None:
+            return self
+        # Asking for a permanent-memory budget implies wanting a permanent
+        # memory. Without this, `load_config("mini", perm_mem="2GB")` would
+        # accept the budget and then silently ignore it, because every preset
+        # ships with the vault off. A budget that is quietly discarded is worse
+        # than one that is refused.
+        #
+        # Only the arguments actually passed are replaced. Passing perm_mem
+        # alone must not clear a temp_mem set earlier -- `set_perm_budget` goes
+        # through here, and clearing the other budget on every live resize is
+        # how a 64MB temp budget silently becomes "uncapped".
+        return replace(
+            self,
+            use_vault=(
+                True if perm_mem is not None and not self.use_vault else self.use_vault
+            ),
+            temp_mem_bytes=(
+                self.temp_mem_bytes if temp_mem is None else parse_bytes(temp_mem)
+            ),
+            perm_mem_bytes=(
+                self.perm_mem_bytes if perm_mem is None else parse_bytes(perm_mem)
+            ),
+        )
+
+    def required_temp_bytes(self) -> int:
+        """Temporary-state bytes this shape needs, int8, one byte per cell.
+
+        Fixed by the trained weights, so unlike the permanent store it is not a
+        knob: narrowing ``d_k``, ``d_v`` or ``n_heads`` would change the model.
+        See :func:`bhanox.budgets.temp_state_bytes` for why ``n_banks`` is absent.
+        """
+        return temp_state_bytes(self.n_layers, self.n_heads, self.d_k, self.d_v)
 
     def check_head_load(self) -> None:
         """Enforce invariant I1 (head-load) for this config.
@@ -318,14 +386,23 @@ def register_preset(config: BhanoxConfig) -> BhanoxConfig:
 
 def load_config(
     source: str | Path | BhanoxConfig | dict[str, Any],
+    *,
+    temp_mem: str | int | None = None,
+    perm_mem: str | int | None = None,
 ) -> BhanoxConfig:
     """Resolve a config from a preset name, a JSON/YAML path, dict, or object.
 
     In simple words: "give me the Nano shape" -- by any of the usual ways.
 
     Args:
-        source: ``"nano"`` / ``"mini"`` / ``"small"``, a path to a JSON file,
-            a mapping of fields, or an existing config.
+        source: ``"nano"`` / ``"mini"`` / ``"small"``, a path to a JSON file, a
+            mapping of fields, or an existing config.
+        temp_mem: Byte budget for the DeltaBank working state, e.g. ``"64MB"``.
+            Spec D7. Defaults to the preset's own requirement, so omitting it
+            changes nothing.
+        perm_mem: Byte budget for the VectorVault, e.g. ``"2GB"``. Spec D7.
+            Lowering it below what a loaded model already holds truncates the
+            vault by importance score rather than raising.
 
     Returns:
         A validated :class:`BhanoxConfig`.
@@ -333,22 +410,30 @@ def load_config(
     Raises:
         KeyError: If a preset name is unknown (message lists valid names).
         FileNotFoundError: If a path does not exist.
-        ValueError: If a file is not valid JSON or a dict is not a valid config.
+        ValueError: If a file is not valid JSON, a dict is not a valid config,
+            or a budget cannot be parsed.
     """
     if isinstance(source, BhanoxConfig):
-        return source
-    if isinstance(source, dict):
-        return BhanoxConfig.from_dict(source)
-    key = str(source)
-    if key in PRESETS:
-        return PRESETS[key]
-    path = Path(key)
-    if path.suffix == ".json" and path.exists():
-        return BhanoxConfig.from_dict(json.loads(path.read_text(encoding="utf-8")))
-    raise KeyError(
-        f"unknown config {key!r}. Presets: {', '.join(available_presets())}; "
-        "or pass a path to a .json config."
-    )
+        config = source
+    elif isinstance(source, dict):
+        config = BhanoxConfig.from_dict(source)
+    else:
+        key = str(source)
+        if key in PRESETS:
+            config = PRESETS[key]
+        else:
+            path = Path(key)
+            if path.suffix == ".json" and path.exists():
+                config = BhanoxConfig.from_dict(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            else:
+                raise KeyError(
+                    f"unknown config {key!r}. Presets: "
+                    f"{', '.join(available_presets())}; or pass a path to a .json "
+                    "config."
+                )
+    return config.with_memory_budgets(temp_mem=temp_mem, perm_mem=perm_mem)
 
 
 ConfigName = Literal["nano", "mini", "small"]

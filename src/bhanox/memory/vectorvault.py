@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
+from bhanox.memory.byte_budget import ByteBudgetMixin
+
 __all__ = ["HYPERVECTOR_BITS", "VectorVault", "bipolar_encode"]
 
 HYPERVECTOR_BITS = 8192
@@ -118,11 +120,16 @@ def _popcount(u8: NDArray[np.uint8]) -> NDArray[np.int64]:
 
 
 @dataclass
-class VectorVault:
+class VectorVault(ByteBudgetMixin):
     """Fixed-slot HDC episodic store with Hamming top-1 retrieval.
 
+    Byte budgeting (spec D7) lives in :class:`ByteBudgetMixin`: this class owns
+    the storage and retrieval, that one owns the ceiling.
+
     Attributes:
-        n_slots: Fixed capacity M. Never grows -- that is the point.
+        n_slots: Current slot count. Shrinks to fit a byte budget, and is
+            restored to ``entry_cap`` when the budget is lifted.
+        entry_cap: The E knob. How many entries this vault may ever hold.
         d_value: Width of a stored value vector.
         bits: Hypervector width. 8192 (1 KB) per key and per value.
         theta_s: Salience threshold. Writes below it are dropped.
@@ -132,6 +139,7 @@ class VectorVault:
         age: ``(n_slots,)`` write timestamp per slot.
         filled: Number of occupied slots.
         clock: Monotonic write counter, used for recency in eviction.
+        perm_budget_bytes: Permanent-memory ceiling, or ``None`` if uncapped.
     """
 
     n_slots: int = 1024
@@ -144,9 +152,10 @@ class VectorVault:
     age: NDArray[np.int64] = field(init=False)
     filled: int = 0
     clock: int = 0
+    perm_budget_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        """Allocate the fixed slots. The vault never reallocates."""
+        """Allocate the slot tables at the entry cap."""
         if self.n_slots <= 0 or self.d_value <= 0:
             raise ValueError("n_slots and d_value must be > 0")
         if self.bits % 8:
@@ -156,22 +165,33 @@ class VectorVault:
         self.values = np.zeros((self.n_slots, self.d_value), dtype=np.float32)
         self.salience = np.zeros(self.n_slots, dtype=np.float32)
         self.age = np.zeros(self.n_slots, dtype=np.int64)
+        # `filled` can arrive non-zero (a caller resuming a session) without the
+        # per-slot arrays matching, so refuse rather than trust it.
+        if self.filled and not self.keys[: self.filled].any():
+            self.filled = 0
+        # The entry count this vault was built with. `n_slots` is the *current*
+        # table size, which a byte budget may shrink; this is the cap, which
+        # only set_entry_cap moves.
+        self.entry_cap = self.n_slots
 
     # -- capacity ------------------------------------------------------------
-
-    @property
-    def nbytes(self) -> int:
-        """Total bytes resident for the vault."""
-        return int(
-            self.keys.nbytes
-            + self.values.nbytes
-            + self.salience.nbytes
-            + self.age.nbytes
-        )
 
     def is_full(self) -> bool:
         """Whether every slot is occupied."""
         return self.filled >= self.n_slots
+
+    def _drop_where(self, drop: NDArray[np.bool_]) -> None:
+        """Compact the vault, discarding entries where ``drop`` is True.
+
+        Survivors are moved down over the holes and the vacated tail is zeroed,
+        so ``filled`` and every per-slot array stay in step.
+        """
+        survivors = np.flatnonzero(~drop)
+        n = survivors.size
+        for arr in (self.keys, self.values, self.salience, self.age):
+            arr[:n] = arr[survivors]
+            arr[n:] = 0
+        self.filled = n
 
     # -- write ---------------------------------------------------------------
 
@@ -201,6 +221,12 @@ class VectorVault:
             raise ValueError(
                 f"VectorVault expected d_value={self.d_value}, got {val.size}"
             )
+        # The budget stops *admission*; slot exhaustion is handled by eviction
+        # below. Only a binding budget blocks a write -- a vault whose slots are
+        # full but whose budget has room must still overwrite, as it always did.
+        allowed = self.budget_entries()
+        if allowed is not None and self.filled >= allowed:
+            return False
         # The gate is on *surprise*, per spec D3. Gating on the value's own norm
         # instead would mean a large but entirely predictable value -- exactly
         # the thing the DeltaBank does not need to remember -- occupies a slot,

@@ -47,6 +47,16 @@ It also resolves the open question left by M1: the recurrent state is currently 
 single instance, so `forward(B, T)` is one concatenated stream. Per-sample state
 is required before a batched loss means anything.
 
+**Done ahead of M2 — spec D7, memory budgets.** Both memories are now explicit,
+bounded, user-settable byte ceilings: `load_config(..., temp_mem=, perm_mem=)`,
+`model.set_perm_budget()`, `bhanox.memory_report()`, and `set_entry_cap()` for
+the count knob. It went in early because the trainer needs a memory budget to
+behave against, and because the spec's sizing formulas were wrong in a way worth
+settling against real arrays: they undercounted the built layout by 2x on the
+temporary state and 14x on the vault, so implementing them literally would have
+violated D7's own "never OOM" rule on the first entry. See
+`docs/architecture.md` for the corrected formulas and what each knob is tied to.
+
 ## M3 — Model zoo, on Kaggle free tier
 
 **Status: not started.**

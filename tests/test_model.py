@@ -185,9 +185,16 @@ class TestInvariants:
     def test_training_mode_does_not_corrupt_inference(self, model: Bhanox) -> None:
         """train=True applies the router's load-balancing bias nudge, so the
         logits shift slightly. It must not change them materially -- the shift
-        should be orders of magnitude below the signal, not comparable to it."""
-        model.reset()
-        a = model.forward(ids(8), train=True)
-        model.reset()
-        b = model.forward(ids(8), train=False)
+        should be orders of magnitude below the signal, not comparable to it.
+
+        Measured on a fresh model, not the shared module-scoped fixture. The
+        nudge scales with accumulated expert load, so a fixture carrying state
+        from earlier tests measures something different each run, and the
+        observed ratio is only ~1.7x under the tolerance. That margin is a CI
+        coin flip; the invariant does not need one.
+        """
+        fresh = Bhanox(CFG)
+        a = fresh.forward(ids(8), train=True)
+        fresh.reset()
+        b = fresh.forward(ids(8), train=False)
         assert np.abs(a - b).max() < 1e-3 * np.abs(b).max()

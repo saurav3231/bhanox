@@ -37,6 +37,15 @@ report = bhanox.audit_bytes_per_token(model)
 print(bhanox.report(model))
 ```
 
+Memory budgets (spec D7) — cap either memory in bytes you choose:
+
+```python
+cfg = bhanox.load_config("mini", temp_mem="64MB", perm_mem="2GB")
+model = bhanox.Bhanox(cfg)
+model.set_perm_budget("4GB")        # live resize; the vault admits or stops
+print(bhanox.memory_report(model))
+```
+
 Verify the invariants and the code doctrine:
 
 ```bash
