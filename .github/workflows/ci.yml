@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # torch is only needed for the C9 contract tests; it is an extra, not
+          # a runtime dependency (law C8). Install CPU wheel to keep it small.
+          pip install -e ".[dev]"
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Black (law C1)
+        run: black --check --diff .
+
+      - name: Ruff (law C2)
+        run: ruff check .
+
+      - name: Mypy (law C2)
+        run: mypy
+
+      - name: Pytest + coverage (law C7)
+        run: pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Module size doctrine (law C5)
+        run: pytest tests/test_codebase_limits.py -v
+
+      - name: Invariants I1-I4 (law D2)
+        run: pytest tests/test_invariants.py -v
+
+      - name: Example smoke tests (law C11)
+        run: |
+          python examples/generate_nano.py
+          python examples/audit_demo.py
+
+      - name: Benchmark harness (P1 speed gate hooks, law C10)
+        run: python scripts/benchmark.py --config nano --tokens 32 --json
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml

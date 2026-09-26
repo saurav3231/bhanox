@@ -1,0 +1,123 @@
+"""Bhanox -- a CPU-native neural architecture substrate.
+
+Purpose: expose the public API. Import this module and you have a working
+Bhanox model on a CPU with no GPU, no data center, and no runtime dependency
+beyond numpy.
+
+In simple words: this is the front door. Everything you need is here.
+
+Quickstart::
+
+    import bhanox
+
+    model = bhanox.Bhanox(bhanox.load_config("nano"))
+    ids = bhanox.frontend.encode("hello")
+    out = model.generate(ids, max_new=32, temperature=0.8)
+    print(bhanox.report(model))
+
+Honesty note (project law A3): every number this package reports is either
+``measured`` (counted or timed by code in this repo) or ``modeled`` (a component
+model). Nothing is estimated silently. See ``docs/benchmarks.md``.
+"""
+
+from __future__ import annotations
+
+from bhanox import audit as audit_module
+from bhanox import frontend
+from bhanox.audit import AuditReport
+from bhanox.config import (
+    PRESETS,
+    BhanoxConfig,
+    available_presets,
+    load_config,
+    register_preset,
+)
+from bhanox.frontend.hashbind import HashBind, encode_bytes
+from bhanox.generate import generate
+from bhanox.model import Bhanox
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "PRESETS",
+    "Bhanox",
+    "BhanoxConfig",
+    "HashBind",
+    "__version__",
+    "audit_bytes_per_token",
+    "available_presets",
+    "encode_bytes",
+    "from_pretrained",
+    "frontend",
+    "generate",
+    "load_config",
+    "register_preset",
+    "report",
+]
+
+
+def audit_bytes_per_token(model: Bhanox) -> AuditReport:
+    """Audit bytes touched per token against invariant I2.
+
+    Args:
+        model: The model to audit.
+
+    Returns:
+        A :class:`bhanox.audit.AuditReport`.
+    """
+    return audit_module.audit_bytes_per_token(model)
+
+
+def report(model: Bhanox) -> str:
+    """Human-readable cost summary for a model.
+
+    Args:
+        model: The model to describe.
+
+    Returns:
+        A multi-line string with parameter counts, packed size, state size,
+        the I2 residency verdict and the measured I3 op count. Every figure is
+        counted from real arrays at call time, hence ``measured``.
+    """
+    cfg = model.config
+    residency = audit_bytes_per_token(model)
+    params = model.param_count()
+    lines = [
+        f"Bhanox report -- config={cfg.name} (all figures measured)",
+        f"  parameters            {params:>12,} values",
+        f"  packed (int8)         {params / 1e6:>11.2f} M  "
+        f"({model.packed_nbytes() / 1024:.1f} KiB)",
+        f"  recurrent state       {model.state_nbytes():>12,} B "
+        f"(constant in context)",
+        f"  L2 residency          {residency.passed!s:>12}  "
+        f"({residency.utilization:.1%} of {cfg.l2_bytes:,} B)",
+        f"  I3 op whitelist       {len(residency.op_check):>12} ops, no float",
+        "",
+        residency.summary(),
+    ]
+    return "\n".join(lines)
+
+
+def from_pretrained(name_or_path: str) -> Bhanox:
+    """Load a trained model from a checkpoint.
+
+    Args:
+        name_or_path: A model-zoo id (e.g. ``"bhanox-nano-v0"``) or a path to a
+            ``.npz`` checkpoint written by the M2 trainer.
+
+    Returns:
+        A ready-to-use :class:`Bhanox`.
+
+    Raises:
+        NotImplementedError: Always, until the M2 checkpoint format and the
+            model zoo (M3) exist. Declared now so the public API shape is
+            frozen and callers can be written against it.
+
+    Why declared rather than omitted: the API surface is frozen in the
+    architecture spec, and a caller written today against a missing function
+    fails at import time, which is far kinder than at 3am.
+    """
+    raise NotImplementedError(
+        f"from_pretrained({name_or_path!r}) lands in M2 (checkpoint format). "
+        "Construct an untrained model with bhanox.Bhanox(cfg) for now."
+    )

@@ -1,0 +1,41 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# artifacts (law C6: no generated files committed)
+*.ckpt
+*.npz
+*.npy
+*.onnx
+*.bin
+bench_out/
+runs/
+logs/
+
+# kaggle credentials -- NEVER commit (law: no secrets, ever)
+kaggle.json
+.env
+.env.*
+*.key
+*.pem
+
+# notebooks
+.ipynb_checkpoints/
+
+# os
+.DS_Store
+Thumbs.db

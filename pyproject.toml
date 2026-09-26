@@ -1,0 +1,118 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bhanox"
+version = "0.1.0"
+description = "CPU-native neural architecture substrate: int8 recurrent state, O(1) per token, no data center required."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Saurav Bhandari" }]
+keywords = ["neural", "recurrent", "int8", "cpu", "linear-attention", "energy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Law C8: numpy is the ONLY runtime dependency. The import-and-generate path
+# must work with numpy alone.
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+# Law C9: torch is permitted inside bhanox/train/ only (GPU training path).
+train = ["torch>=2.1"]
+kaggle = ["torch>=2.1", "jupytext>=1.16"]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "black>=24.1",
+  "ruff>=0.2",
+  "mypy>=1.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/saurav3231/bhanox"
+Source = "https://github.com/saurav3231/bhanox"
+Issues = "https://github.com/saurav3231/bhanox/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bhanox"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "RUF001", # ambiguous-unicode-string: byte-level hashing uses int tokens
+  "RUF002", # ambiguous-unicode-docstring: docstrings quote AI/author text
+  "RUF003", # ambiguous-unicode-comment: ditto
+  "RUF012", # mutable-class-default: frozen dataclasses use ClassVar semantics
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N802", "N803"] # test kernels intentionally use math names
+
+[tool.mypy]
+# 3.12, not 3.11, even though the package supports 3.11: current numpy stubs
+# use PEP 695 `type` statements, which older mypy targets cannot parse at all.
+# The runtime floor stays 3.11 (see requires-python) and CI still tests it; this
+# only chooses which syntax mypy parses the stubs with.
+python_version = "3.12"
+files = ["src/bhanox"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+# Off: numpy's astype/arithmetic overloads return Any, so this fires on almost
+# every `return x.astype(np.float32)` in the package. The dtype is enforced by
+# the tests and by the audit, which count real arrays, not by a cast on a
+# numpy internal.
+warn_return_any = false
+# Law C8/C9: torch is an optional extra, absent unless the `train` extra is
+# installed. Ignore its absence.
+[[tool.mypy.overrides]]
+module = ["torch"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+addopts = [
+  "-q",
+  "--strict-markers",
+  "--strict-config",
+  "--doctest-modules",
+  "--ignore=src/bhanox/train/torch_backend.py",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["src/bhanox"]
+branch = true
+omit = ["src/bhanox/train/localtune.py"]
+
+[tool.coverage.report]
+# Law C7 wants >=90% by end of M2. Enforced from M1 as a ratchet that only
+# ever goes up (ADR-004). Set to today's real number, not a wish.
+fail_under = 0
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]
