@@ -13,6 +13,34 @@ python examples/audit_demo.py
 
 ---
 
+## Audit: which numbers survived the d0c6724 init fix
+
+`d0c6724` made weight init reproducible and gave each head and layer its own
+stream. Before it, the read-out, bypass, unembed and MoE weights were redrawn
+every process (`hash()` on a str), and all `n_heads` heads of a layer shared one
+stream — byte-identical, and identical through the whole forward pass.
+
+That is a behaviour change, so every measured figure was re-checked rather than
+assumed. **None turned out to be stale**, for reasons worth recording:
+
+| figure | verdict | why |
+|---|---|---|
+| params, packed size, state B, B/token, L2 %, I2 | unaffected | computed from shapes, not weight values. `param_count` re-checked at 2,107,460. |
+| reference speed, ~51 tok/s | unaffected | timing does not depend on weight values; `n_heads` still does the same arithmetic. Re-measured 4x: 45.4 / 45.8 / 56.5 / 55.6 — the spread is machine variance, and ~51 sits inside it. |
+| delta rule vs additive, 0.213 vs 0.375 | unaffected | re-measured identical. The test injects its own weights (`default_rng(11)`) in `make_head`, so it never depended on the init key. |
+| decay banks, 5,430 vs 2,456 (2.21x) | unaffected | re-measured identical, same reason. Also pinned by `pytest.approx(2.21, abs=0.01)`, so it cannot drift silently. |
+| PulseGate 75% / 0% | unaffected | the gate has no weights; it is driven by synthetic input. |
+| MicroExpert 5.7x, VectorVault, HashBind | unaffected | byte counts and self-seeded components, untouched by the fix. |
+
+**What is still unmeasured is the multi-head capacity claim.** The architecture
+table advertises `n_heads` as the sanctioned way to add independent memories.
+Until `d0c6724` that could not have been true — the heads were copies — so no
+figure here ever demonstrated a benefit from `n_heads > 1`. The claim is now
+implementable; it is not yet demonstrated. Treated as **NOT MEASURED** until a
+multi-head capacity experiment says otherwise.
+
+---
+
 ## The one number that is not measured
 
 **P1: `>= 20,000 tokens/s`.** Status: **NOT MEASURED**, pending M4.

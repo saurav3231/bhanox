@@ -22,6 +22,26 @@ def ids(n: int = 8) -> np.ndarray:
     return rng.integers(0, VOCAB, n).astype(np.int64)
 
 
+# "Same arithmetic, different array shape" is the only thing that needs a float
+# tolerance here, and it is not the same claim as "same integers", so the bound
+# is derived rather than tuned. float32 carries ~1.2e-7 of precision; the
+# logits come out of roughly 50 matmuls of length 128, so two runs of identical
+# arithmetic can differ by ~1e-5 with errors walking randomly and ~6e-5 if they
+# line up. A structural difference -- a row reading another row's state, a
+# transposed bypass -- moves these by O(1). So 1e-3 sits an order of magnitude
+# above the pessimistic float case and three orders below the structural one.
+#
+# This is a gross-divergence guard, not a precision claim. Claims that must be
+# exact are asserted on the int32 state with array_equal, where a leak shows up
+# as whole numbers and no tolerance can hide it. Prefer that.
+FLOAT32_SLOP = 1e-3
+
+
+def same_float(a: np.ndarray, b: np.ndarray) -> bool:
+    """True if two float32 results are the same computation within float noise."""
+    return bool(np.allclose(a, b, rtol=FLOAT32_SLOP, atol=FLOAT32_SLOP))
+
+
 class TestShapes:
     def test_single_token(self, model: Bhanox) -> None:
         assert model.step(np.array([5], np.int64)).shape == (VOCAB,)
@@ -77,7 +97,7 @@ class TestStepping:
         model.reset()
         first = model.step(np.array([7], np.int64))
         model.reset()
-        assert np.allclose(first, model.step(np.array([7], np.int64)))
+        assert same_float(first, model.step(np.array([7], np.int64)))
 
     def test_reset_also_flushes_the_gates(self, model: Bhanox) -> None:
         model.reset()
@@ -125,9 +145,8 @@ class TestBatchSemantics:
 
     That warning was honoured rather than ignored: M2 made the change
     deliberately, in the open, and the second half of it turned out to be free.
-    Every measurement in ``docs/benchmarks.md`` was taken at batch 1, and batch-1
-    results are bit-identical before and after, because the recurrence is
-    integer arithmetic and integer addition is associative. Nothing moved.
+    Every measurement in ``docs/benchmarks.md`` was taken at batch 1, and
+    batch-1 behaviour is unchanged by the refactor -- measured, not assumed.
     """
 
     def test_a_row_is_independent_of_its_neighbours(self, model: Bhanox) -> None:
@@ -135,54 +154,43 @@ class TestBatchSemantics:
         b = np.array([31, 40, 7, 19], np.int64)
         model.reset()
         batched = model.forward(np.stack([a, b]))
+        state_batched = [h.state[1].copy() for h in model.deltabanks[0].heads]
+        mask_batched = [g.awake.copy() for g in model.gates]
+
         model.reset()
         alone = model.forward(b)
-        # Not array_equal, and deliberately so: a (2, d) matmul and a (1, d)
-        # matmul sum in a different order in float32, so bit-equality across
-        # batch sizes is not a property any float library offers. The
-        # tolerance is relative to the signal, not absolute.
-        assert np.allclose(batched[1], alone[0], rtol=1e-5, atol=1e-5)
+        state_alone = [h.state[0].copy() for h in model.deltabanks[0].heads]
+        mask_alone = [g.awake.copy() for g in model.gates]
 
-    def test_the_recurrent_state_is_exactly_per_sample(self, model: Bhanox) -> None:
-        """The float read-out drifts; the memory itself must not.
+        # The discriminating assertions, and the exact ones. If row 1 had read
+        # anything row 0 wrote, the int32 state would differ by whole numbers
+        # and the gate would take a different branch. These are platform-
+        # independent: no floating-point tolerance is involved, so they cannot
+        # be softened by a different BLAS. The state one is the assertion that
+        # matters -- int32 means a leak shows up as integers, not as rounding.
+        for got, want in zip(state_batched, state_alone, strict=True):
+            assert np.array_equal(got, want), "recurrent state leaked across rows"
+        for got, want in zip(mask_batched, mask_alone, strict=True):
+            assert np.array_equal(got[1], want[0]), "gate decisions leaked across rows"
 
-        This is the assertion that actually matters. The DeltaBank state is
-        int32, so if sample ``b`` read anything sample ``a`` wrote, the arrays
-        differ by a whole number rather than by float32 rounding.
-        """
-        head = model.deltabanks[0].heads[0]
-        ids = np.array([3, 9, 14, 22, 31, 40], np.int64)
-        other = np.full(6, 7, np.int64)
-        model.reset()
-        model.forward(ids)
-        solo = head.state[0].copy()
-        model.reset()
-        # `ids` must be the *second* row: row 0 is the neighbour it has to be
-        # immune to.
-        model.forward(np.stack([other, ids]))
-        assert np.array_equal(solo, head.state[1])
-
-    def test_a_row_no_longer_sees_the_rows_before_it(self, model: Bhanox) -> None:
-        """The old semantics, asserted in reverse.
-
-        This used to read "pins the shared-state semantics, so nobody later
-        'fixes' it". Now it pins the fix: a row must not reach the rows after
-        it, which is the whole reason a batched loss means anything.
-        """
-        ids = np.array([3, 9, 14, 22], np.int64)
-        junk = np.array([99, 98, 97, 96], np.int64)
-        model.reset()
-        alone = model.forward(ids)[0]
-        model.reset()
-        batched = model.forward(np.stack([junk, ids]))
-        assert np.allclose(alone, batched[1], rtol=1e-5, atol=1e-5)
+        # The logits agree only to float tolerance, and deliberately do not use
+        # array_equal: a (2, T, d) reduction and a (1, T, d) one sum in a
+        # different order in float32.
+        assert same_float(batched[1], alone[0])
 
     def test_batch_size_one_is_the_reference(self, model: Bhanox) -> None:
+        """A (1, T) batch takes the same path as a bare (T,) window.
+
+        Checked with the same float slack as row independence, for the same
+        reason: a (1, T, d) matmul and a (T, d) one are not bit-equal in
+        float32, and the state behind them is compared exactly elsewhere in
+        this class.
+        """
         ids = np.array([5, 6, 7, 8], np.int64)
         model.reset()
         plain = model.forward(ids)
         model.reset()
-        assert np.allclose(model.forward(ids[None, :]), plain)
+        assert same_float(model.forward(ids[None, :]), plain)
 
 
 class TestCost:

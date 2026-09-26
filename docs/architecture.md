@@ -127,6 +127,13 @@ What is tied to the trained model, and what is a free knob:
 implies buying memory by widening the bank mix, but B only selects decay rates.
 Widen B and the state does not move.
 
+`n_heads` buys *distinct* memories only as of `d0c6724`. Before it, every head
+of a layer drew the same init stream and stayed byte-identical through the whole
+forward pass, so `n_heads` was `n_heads` copies of one memory paying `n_heads`
+times the arithmetic. The streams are now keyed per head
+(`bhanox.seeding.init_rng`). The mechanism is real; the capacity benefit is
+**NOT MEASURED** — see the audit note in `docs/benchmarks.md`.
+
 Budgets bound **bytes**, not admissions. The vault allocates its slot table up
 front, so a budget that merely stopped writes would still hold 1.5 MB resident
 while reporting 64 KB. `set_budget` resizes the table, so a 64 KB budget really
