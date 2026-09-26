@@ -69,6 +69,34 @@ Some specific expectations:
   target. If the number moves, the *claim* moved.
 - Prefer a property to an example where both are available.
 
+## Heavy jobs run on Kaggle, not here
+
+**Never run a job expected to take more than ~60 seconds on this machine.** That
+includes the full `pytest` suite (~2 min), training runs, and any benchmark on
+real data. This machine runs unit tests and tiny smoke tests, nothing else.
+
+The full suite still has to pass before anything is committed, and CI runs it on
+every push. So the loop is: push, read CI. Do not run the suite locally to get a
+faster answer than CI already gives you.
+
+For anything genuinely heavy, the path is the Kaggle hand-off, not a local run
+and not a request for Saurav to run it on his machine:
+
+1. Write a self-contained runner into `kaggle/` — fixed seeds, automatic data
+   download, checkpoint every 30 minutes with auto-resume, and results printed as
+   one delimited JSON block, also saved to `results/<run_id>.json`.
+2. Push it, and hand Saurav the one-cell bootstrap snippet, plus which
+   accelerator to pick and the expected wall-time.
+3. Saurav runs it in a Kaggle notebook and returns the JSON block.
+4. Commit the results to `docs/benchmarks.md` and `results/` the same day,
+   labelled `measured`, whatever they say.
+
+Budgets follow measured hardware rates, not guesses: Kaggle T4 is ~3 TFLOPS
+effective, Kaggle CPU (4 cores) ~30-50 GFLOPS effective. Training cost is
+~6 x params x tokens per step. Sessions die without warning and the weekly quota
+is ~30 GPU-hours, so every runner checkpoints and every runner is idempotent —
+safe to re-run after a session death.
+
 ## Pull requests
 
 One concern per commit. Describe what you changed and, more importantly, what you

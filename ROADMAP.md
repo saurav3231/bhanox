@@ -47,13 +47,44 @@ It also resolves the open question left by M1: the recurrent state is currently 
 single instance, so `forward(B, T)` is one concatenated stream. Per-sample state
 is required before a batched loss means anything.
 
-## M3 — Model zoo
+## M3 — Model zoo, on Kaggle free tier
 
 **Status: not started.**
 
-Published checkpoints, `from_pretrained`, and reproducible evaluation. The
-function is declared and raises today so callers can be written against the final
-API shape.
+Every heavy job runs on Kaggle through the hand-off loop in `CONTRIBUTING.md`.
+Nothing in this milestone runs on a local machine, and Saurav is never asked to
+run anything locally either.
+
+Write `kaggle/run_mini_train.py` and `kaggle/bootstrap.py`: Mini on
+TinyStories-class data, GPU-T4 track, budgeted per the timing table. Optional CPU
+thesis track: `kaggle/run_nano_cpu.py`, the full Nano lifecycle on Kaggle CPU
+only.
+
+Baseline runners on identical data, splits and seeds: an equal-parameter
+Transformer, an equal-parameter GRU, and a 4x-parameter Transformer.
+
+Every run is handed over as the one-cell bootstrap snippet, with the accelerator
+and expected wall-time stated. Results Saurav returns are committed to
+`docs/benchmarks.md` and `results/` the same day, labelled `measured`, whatever
+they say — including a result where Bhanox loses.
+
+Planning numbers, from measured hardware rates (T4 ~3 TFLOPS effective, Kaggle
+CPU 4 cores ~30-50 GFLOPS effective, cost ~6 x params x tokens per step):
+
+| job | FLOPs/step | T4 | CPU (4 cores) |
+|---|---|---|---|
+| Nano 1.1M, batch 32x256 | ~54 GFLOPs | ~10-30 s / 1000 steps | ~15-30 min / 1000 steps |
+| Mini 13M, batch 64x512 | ~2.6 TFLOPs | ~15 min / 1000 steps, ~7-8 h full | ~18 h / 1000 steps — do not |
+| 20M Transformer baseline | ~123 GFLOPs (batch 8x128) | <1 min / 1000 steps | ~40-70 min / 1000 steps |
+
+So Mini and all baselines go on the GPU-T4 track. Quota is ~30 GPU-hours a week
+and sessions die without warning, which is why every runner checkpoints and
+resumes. Corpus goes up once as a private Kaggle Dataset, with a download
+fallback for sessions that have network.
+
+`from_pretrained` and reproducible evaluation are also part of this milestone;
+the function is declared and raises today so callers can be written against the
+final API shape.
 
 ## M4 — Native runtime
 
