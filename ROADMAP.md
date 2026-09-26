@@ -57,6 +57,13 @@ temporary state and 14x on the vault, so implementing them literally would have
 violated D7's own "never OOM" rule on the first entry. See
 `docs/architecture.md` for the corrected formulas and what each knob is tied to.
 
+**Deferred to M4: the D7 CLI.** The spec's example is
+`bhanox serve mini.nx --temp-mem 64MB --perm-mem 2GB --perm-storage disk`, and
+none of it exists — the repo has no entry point and no `serve` command. A serve
+loop and a disk-overflow store are runtime concerns, and M4 is where a runtime
+gets built, so the CLI belongs there rather than growing a second surface now
+and rewriting it later. D7 ships as a library API, which is complete and tested.
+
 ## M3 — Model zoo, on Kaggle free tier
 
 **Status: not started.**
