@@ -5,6 +5,8 @@ actually runs, and how much of the story is measured rather than modelled.
 
 Status legend: **done** / **in progress** / **not started**.
 
+Shipped as `v0.1.0`.
+
 ---
 
 ## M0 — Repository skeleton
@@ -17,7 +19,9 @@ packaging.
 
 ## M1 — Reference implementation
 
-**Status: in progress.**
+**Status: done.** Shipped in `v0.1.0` together with M0: the skeleton commit
+cannot be green on its own, because `pip install -e .` needs the package that
+M1 is, so there was only ever one shippable state.
 
 Every component of the frozen architecture, in NumPy, with a test per
 mechanism, and the I1–I3 gates enforced.
