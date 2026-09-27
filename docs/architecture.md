@@ -178,6 +178,27 @@ assumed: on the nano config, the same prompt gives the same int32 state, the
 same gate decisions per token, and float32 logits bit-identical to the
 pre-M2 path (`max|diff| == 0.0`). See the note on `Bhanox.forward`.
 
+## Checkpoints
+
+`src/bhanox/checkpoint.py`. Versioned, atomic, NumPy-only, and bit-exact — 124
+tensors round-trip with `max|diff| == 0.0` and identical logits.
+
+Three decisions, each of which is a way this could have gone wrong:
+
+| decision | why |
+|---|---|
+| tensors discovered by walking the model | a hand-written field list silently drops any parameter added later, and training resumes from a checkpoint that quietly lost it |
+| write to a temp file, then `os.replace` | a crash mid-write must not destroy the checkpoint that was already there |
+| parameters only, no recurrent state | keeps a checkpoint proportional to parameters rather than context, and stops a file's contents from depending on the batch size of the run that wrote it |
+
+The third has a consequence worth stating plainly: `from_pretrained` returns a
+model with an **empty** state, and resuming mid-sequence without carrying the
+state is a different computation. `forward` continues from existing state rather
+than resetting, so a trainer that keeps the recurrent buffers alongside the
+checkpoint gets a bit-exact resume. Both directions are pinned in
+`tests/test_checkpoint.py` — carrying it matches the uninterrupted run, and
+dropping it does not, so neither test can pass for the wrong reason.
+
 ## Assembly
 
 `src/bhanox/model.py` is not in the frozen architecture table. It exists because

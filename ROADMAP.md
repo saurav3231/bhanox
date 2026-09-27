@@ -38,10 +38,30 @@ test.
 
 ## M2 — Training
 
-**Status: not started.**
+**Status: in progress.** The checkpoint format is done. The trainer and the first
+real weights are not.
 
 The trainer, the checkpoint format, and the first real weights. This is where
 perplexity becomes a number instead of a `NOT MEASURED`.
+
+**Done ahead of M2 — the checkpoint format.** `bhanox.checkpoint.save()` /
+`load()`, plus `bhanox.from_pretrained()`, which was declared as a frozen API
+hook and raised until this landed. Versioned, atomic, NumPy-only, and
+bit-exact: 124 tensors round-trip with `max|diff| == 0.0` and the restored model
+produces identical logits. Three decisions worth knowing:
+
+- The tensor list is **discovered by walking the model**, not hand-written, so a
+  new parameter cannot be silently left out of a checkpoint. A hand-maintained
+  list is where that bug hides.
+- Writes go to a sibling temp file, fsync, then `os.replace`. A crash mid-save
+  leaves the *previous* checkpoint intact, which is tested by making the write
+  fail.
+- Only parameters are saved, not recurrent state. That is what keeps a
+  checkpoint proportional to parameters rather than context length, and it
+  stops a file's contents from depending on the batch size of whichever run
+  wrote it. Because `forward` continues from existing state rather than
+  resetting, a caller that carries the state separately still gets a bit-exact
+  mid-sequence resume; both directions are pinned in `tests/test_checkpoint.py`.
 
 **Done ahead of M2 — per-sample state.** The question M1 left open is closed.
 The recurrent state carries a sample axis, so a batched loss means what it

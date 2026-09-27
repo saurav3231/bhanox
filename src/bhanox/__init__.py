@@ -22,8 +22,10 @@ model). Nothing is estimated silently. See ``docs/benchmarks.md``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from bhanox import audit as audit_module
-from bhanox import frontend
+from bhanox import checkpoint, frontend
 from bhanox.audit import AuditReport
 from bhanox.config import (
     PRESETS,
@@ -46,6 +48,7 @@ __all__ = [
     "__version__",
     "audit_bytes_per_token",
     "available_presets",
+    "checkpoint",
     "encode_bytes",
     "from_pretrained",
     "frontend",
@@ -149,22 +152,23 @@ def from_pretrained(name_or_path: str) -> Bhanox:
     """Load a trained model from a checkpoint.
 
     Args:
-        name_or_path: A model-zoo id (e.g. ``"bhanox-nano-v0"``) or a path to a
-            ``.npz`` checkpoint written by the M2 trainer.
+        name_or_path: A path to a ``.npz`` checkpoint written by
+            :func:`bhanox.checkpoint.save`.
 
     Returns:
-        A ready-to-use :class:`Bhanox`.
+        A ready-to-use :class:`Bhanox`, built from the config recorded in the
+        checkpoint and restored bit-exactly.
 
     Raises:
-        NotImplementedError: Always, until the M2 checkpoint format and the
-            model zoo (M3) exist. Declared now so the public API shape is
-            frozen and callers can be written against it.
+        OSError: The file is not a Bhanox checkpoint.
+        ValueError: The version is unknown, or a tensor does not fit the
+            recorded architecture.
 
-    Why declared rather than omitted: the API surface is frozen in the
-    architecture spec, and a caller written today against a missing function
-    fails at import time, which is far kinder than at 3am.
+    Note:
+        The recurrent state is deliberately not in the file, so the returned
+        model starts with an empty state. That is what keeps a checkpoint
+        proportional to parameters rather than to context length. A trainer that
+        needs a bit-exact mid-sequence resume carries the state itself; see
+        :mod:`bhanox.checkpoint`.
     """
-    raise NotImplementedError(
-        f"from_pretrained({name_or_path!r}) lands in M2 (checkpoint format). "
-        "Construct an untrained model with bhanox.Bhanox(cfg) for now."
-    )
+    return checkpoint.load(Path(name_or_path))
