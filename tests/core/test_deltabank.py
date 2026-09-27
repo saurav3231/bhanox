@@ -20,7 +20,7 @@ from bhanox.core.deltabank import (
     recip_lut,
 )
 from bhanox.core.deltabank_layer import DeltaBankLayer
-from bhanox.quant.numerics import INT8_MAX
+from bhanox.quant.numerics import INT8_MAX, quantize_activation
 
 D_IN, D_K, D_V, BANKS = 32, 64, 32, 8
 RATES = np.array([1.0 - 2.0**-b for b in range(1, BANKS + 1)], dtype=np.float32)
@@ -326,3 +326,132 @@ class TestLayer:
         layer = DeltaBankLayer(load_config("nano"))
         with pytest.raises(ValueError, match="d_model"):
             layer.forward(np.ones(3, dtype=np.float32))
+
+
+CAP_ITEMS = 32
+CAP_SEEDS = (7, 99, 1234)
+
+
+def _capacity_heads(n_heads: int) -> list[DeltaBankHead]:
+    """Production heads, not the injected-weights helper.
+
+    The point of this measurement is the shipped initialisation, so the heads
+    come from the real seed/name/head_index path. ``make_head`` overwrites the
+    weights and would test a memory the model never runs.
+    """
+    cfg = load_config("nano")
+    return [
+        DeltaBankHead(
+            d_k=cfg.d_k,
+            d_v=cfg.d_v,
+            d_in=cfg.d_model,
+            n_banks=cfg.n_banks,
+            seed=cfg.seed,
+            name=cfg.name,
+            head_index=h,
+        )
+        for h in range(n_heads)
+    ]
+
+
+def _stored_items(seed: int, n: int) -> np.ndarray:
+    xs = np.random.default_rng(seed).standard_normal((n, load_config("nano").d_model))
+    return unit_rows(xs.astype(np.float32))
+
+
+def retrieval_accuracy(heads: list[DeltaBankHead], xs: np.ndarray) -> float:
+    """Fraction of stored items whose readout lands nearest its own value.
+
+    Deliberately not :func:`recall_error`. That metric has a floor set by the
+    decay schedule and the read gate -- on a single repeated item it plateaus at
+    0.79 and stays there from 10 to 1000 repeats -- so it cannot resolve
+    capacity. This asks a scale-free question instead: is the right item the
+    nearest of the N stored ones? Chance is 1/N, perfect is 1.0, and neither the
+    decay floor nor the read gate's per-channel gain can move the answer.
+
+    Items are spread round-robin, so a prefix loads every head evenly instead
+    of filling head 0 first, which would flatter one head early and punish the
+    rest late.
+    """
+    cfg = load_config("nano")
+    buckets: list[list[int]] = [[] for _ in heads]
+    for i in range(len(xs)):
+        buckets[i % len(heads)].append(i)
+
+    rates = np.asarray(cfg.decay_rates, dtype=np.float32)
+
+    for head, idxs in zip(heads, buckets, strict=True):
+        head.reset()
+        if not idxs:
+            continue
+        for _ in range(20):
+            for i in idxs:
+                head.forward(xs[i], rates)
+
+    # Each item's value comes from the head that stored it. Scoring everything
+    # against head 0's W_v leaves the other heads unmatchable and pins the
+    # multi-head arm at exactly chance.
+    values = np.stack(
+        [
+            np.clip(x @ heads[i % len(heads)].W_v / INT8_MAX, -1.0, 1.0)
+            for i, x in enumerate(xs)
+        ]
+    )
+
+    hits = 0
+    for head, idxs in zip(heads, buckets, strict=True):
+        for i in idxs:
+            k8 = quantize_activation(key_of(head, xs[i]))
+            readout = (head.state[0].T @ k8) / float(INT8_MAX**2)
+            hits += int(np.argmin(np.linalg.norm(values - readout, axis=1)) == i)
+    return hits / len(xs)
+
+
+class TestHeadCapacity:
+    """n_heads is the sanctioned way to add capacity, so it should demonstrably
+    buy capacity. Before the seeding fix the heads were byte-identical and this
+    was not measurable: four copies of one memory are not four memories.
+
+    Measured across five item draws: 1 head holds 16-24 items at >=50%
+    retrieval accuracy (median 20, d_k = 16); 4 heads hold 48-64 (median 48).
+    The ratio spans 2.40x-4.00x, median 2.67x -- short of the ideal 4x because
+    the heads share one input space, so cross-head interference is not zero.
+    """
+
+    @pytest.mark.parametrize("seed", CAP_SEEDS)
+    def test_four_heads_retain_more_than_one(self, seed: int) -> None:
+        """At twice the single-head ceiling, one head has lost the plot and four
+        have not. Measured: 1 head <= 0.281, 4 heads >= 0.812 (gap +0.53)."""
+        xs = _stored_items(seed, CAP_ITEMS)
+        one = retrieval_accuracy(_capacity_heads(1), xs)
+        four = retrieval_accuracy(_capacity_heads(4), xs)
+        assert (
+            four > 0.7
+        ), f"4 heads lost the advantage at {CAP_ITEMS} items: {four:.3f}"
+        assert (
+            one < 0.5
+        ), f"1 head unexpectedly still accurate at {CAP_ITEMS}: {one:.3f}"
+        assert (
+            four > 2 * one
+        ), f"advantage too thin: 1 head {one:.3f}, 4 heads {four:.3f}"
+
+    @pytest.mark.parametrize("seed", CAP_SEEDS)
+    def test_single_head_degrades_past_its_key_budget(self, seed: int) -> None:
+        """One head holds d_k keys, and it starts feeling the squeeze early:
+        8 items already costs it accuracy (measured 0.750-0.875, not 1.0),
+        because 8 random vectors in d_k=16 share a pairwise cosine of ~0.25
+        rather than being orthogonal. By 48 items it is at chance. If this ever
+        passes trivially the measurement is broken.
+        """
+        easy = retrieval_accuracy(_capacity_heads(1), _stored_items(seed, 8))
+        hard = retrieval_accuracy(_capacity_heads(1), _stored_items(seed, 48))
+        assert easy > 0.7, f"single head cannot hold 8 items at all: {easy:.3f}"
+        assert (
+            hard < 0.3
+        ), f"single head immune to overload, measurement is wrong: {hard:.3f}"
+
+    def test_accuracy_is_not_trivially_high(self) -> None:
+        """Guards the guard: with 32 items, chance is 0.031, so a metric stuck
+        near 1.0 would mean the probe is not discriminating at all."""
+        xs = _stored_items(7, CAP_ITEMS)
+        assert retrieval_accuracy(_capacity_heads(1), xs) < 0.5

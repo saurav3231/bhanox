@@ -36,8 +36,11 @@ assumed. **None turned out to be stale**, for reasons worth recording:
 table advertises `n_heads` as the sanctioned way to add independent memories.
 Until `d0c6724` that could not have been true — the heads were copies — so no
 figure here ever demonstrated a benefit from `n_heads > 1`. The claim is now
-implementable; it is not yet demonstrated. Treated as **NOT MEASURED** until a
-multi-head capacity experiment says otherwise.
+measured: a head with `d_k=16` holds 16–24 items at ≥50% retrieval accuracy
+(median 20) and 4 heads hold 48–64 (median 48), ratio 2.40x–4.00x (median
+2.67x) across five item draws. The ideal 4x is not reached because the heads
+share one input space and interference is not zero. See the regression guard at
+`tests/core/test_deltabank.py::TestHeadCapacity`.
 
 ---
 
@@ -104,6 +107,7 @@ model. The cited test is the regression guard.
 | VectorVault recall, 10% noise | 1.000 | `test_noise_still_recovers_most_items` |
 | HashBind unknown ids | embed with no table row | `test_unseen_token_still_embeds` |
 | HashBind negative ids | no table row, not the last one | `test_negative_id_gets_no_direct_row` |
+| 4 heads vs 1 head capacity | 48–64 vs 16–24 items at ≥50% (median 2.67x) | `TestHeadCapacity.test_four_heads_retain_more_than_one` |
 
 The absolute recall and distance numbers are low because the model is
 untrained; the claims are about the *sign* and the ratio, which is what the

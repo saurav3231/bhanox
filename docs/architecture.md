@@ -132,7 +132,11 @@ of a layer drew the same init stream and stayed byte-identical through the whole
 forward pass, so `n_heads` was `n_heads` copies of one memory paying `n_heads`
 times the arithmetic. The streams are now keyed per head
 (`bhanox.seeding.init_rng`). The mechanism is real; the capacity benefit is
-**NOT MEASURED** — see the audit note in `docs/benchmarks.md`.
+measured: a head with `d_k=16` holds 16–24 items at ≥50% retrieval accuracy
+(median 20) and 4 heads hold 48–64 (median 48), ratio 2.40x–4.00x (median
+2.67x) across five item draws. The ideal 4x is not reached because the heads
+share one input space. See `TestHeadCapacity` in
+`tests/core/test_deltabank.py`.
 
 Budgets bound **bytes**, not admissions. The vault allocates its slot table up
 front, so a budget that merely stopped writes would still hold 1.5 MB resident
