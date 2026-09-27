@@ -235,6 +235,14 @@ class PulseGate:
 
     # -- reporting -----------------------------------------------------------
 
+    def param_count(self) -> int:
+        """Learned parameter values: the three per-channel threshold arrays.
+
+        ``cached``, ``awake`` and the counters are runtime state, not
+        parameters, and are excluded here as they are from the checkpoint.
+        """
+        return int(self.tau_hi.size + self.tau_lo.size + self.salience.size)
+
     def skip_rate(self) -> float:
         """Fraction of channel-steps skipped since the last reset.
 

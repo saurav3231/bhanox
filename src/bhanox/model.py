@@ -174,14 +174,26 @@ class Bhanox:
     # -- parameters ----------------------------------------------------------
 
     def param_count(self) -> int:
-        """Total stored parameter values, excluding the recurrent state.
+        """Total learned parameter values, excluding the recurrent state.
 
         The state is a fixed buffer, not a parameter: it is re-created on reset
         and is not checkpointed, which is what makes a checkpoint tiny.
+
+        The gates count. Their per-channel wake/sleep thresholds are learned and
+        are trained like any other weight, so a size claim that excluded them
+        would under-report what the optimizer actually updates -- and, during
+        training, silently omit 1,536 values from the bill. ``test_checkpoint``
+        pins this total against the checkpoint's own tensor walk so a future
+        parameter cannot escape both.
+
+        Derived-from-config arrays are excluded: ``DeltaBankLayer.bank_rates``
+        is a cached broadcast of ``cfg.decay_rates``, not something learned, and
+        counting it would make the number depend on how a constant is cached.
         """
         total = self.embedder.param_count() + int(self.output.size)
         total += sum(b.param_count() for b in self.deltabanks)
         total += sum(m.param_count() for m in self.mixers)
+        total += sum(g.param_count() for g in self.gates)
         return int(total)
 
     def state_nbytes(self) -> int:

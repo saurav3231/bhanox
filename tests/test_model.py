@@ -197,7 +197,7 @@ class TestCost:
     def test_parameter_count_is_pinned(self) -> None:
         """A frozen architecture should not drift by accident. This is a
         regression guard, not a target: if a change moves it, say why."""
-        assert Bhanox(load_config("nano")).param_count() == 2_107_460
+        assert Bhanox(load_config("nano")).param_count() == 2_108_996
 
     def test_packed_size_is_one_byte_per_parameter(self, model: Bhanox) -> None:
         assert model.packed_nbytes() == model.param_count()

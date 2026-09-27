@@ -90,8 +90,8 @@ it) or `modeled` (a component model, not an end-to-end measurement).
 | Generation cost per token | constant, O(1) in context | **measured** | `test_state_stays_bounded_while_generating` |
 | Inference arithmetic | integer only, no float ops | **measured** | `tests/test_invariants.py` (I3) |
 | State size | fixed, independent of context | **measured** | `test_state_is_constant_over_a_long_context` |
-| Packed params (nano) | 2.11 MB (2,107,460 values) | **measured** | `bhanox.report(model)` |
-| Packed params (mini / small) | 24.34 MB / 324.93 MB | **measured** | `bhanox.report(model)` |
+| Packed params (nano) | 2.11 MB (2,108,996 values) | **measured** | `bhanox.report(model)` |
+| Packed params (mini / small) | 24.35 MB / 324.95 MB | **measured** | `bhanox.report(model)` |
 | Delta rule vs additive writes (recall, untrained) | 0.213 vs 0.375 | **measured** | `test_delta_rule_beats_additive_writes` |
 | Decay banks vs single decay (state energy) | 5,430 vs 2,456 (2.2x) | **measured** | `test_decay_banks_outlast_a_single_fast_decay` |
 | PulseGate compute skipped, steady input | 75% | **measured** | `test_steady_input_is_mostly_skipped` |

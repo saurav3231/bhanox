@@ -20,9 +20,9 @@ from bhanox.model import Bhanox
 
 # Measured from the arrays at audit time, not targeted. See docs/benchmarks.md.
 EXPECTED = {
-    "nano": (2_107_460, 8_192, True, 110_592),
-    "mini": (24_338_948, 131_072, True, 720_896),
-    "small": (324_929_540, 1_048_576, False, 3_538_944),
+    "nano": (2_108_996, 8_192, True, 110_592),
+    "mini": (24_345_092, 131_072, True, 720_896),
+    "small": (324_954_116, 1_048_576, False, 3_538_944),
 }
 PRESETS = list(EXPECTED)
 

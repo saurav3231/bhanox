@@ -25,7 +25,7 @@ assumed. **None turned out to be stale**, for reasons worth recording:
 
 | figure | verdict | why |
 |---|---|---|
-| params, packed size, state B, B/token, L2 %, I2 | unaffected | computed from shapes, not weight values. `param_count` re-checked at 2,107,460. |
+| params, packed size, state B, B/token, L2 %, I2 | unaffected | computed from shapes, not weight values. `param_count` re-checked at 2,108,996. |
 | reference speed, ~51 tok/s | unaffected | timing does not depend on weight values; `n_heads` still does the same arithmetic. Re-measured 4x: 45.4 / 45.8 / 56.5 / 55.6 — the spread is machine variance, and ~51 sits inside it. |
 | delta rule vs additive, 0.213 vs 0.375 | unaffected | re-measured identical. The test injects its own weights (`default_rng(11)`) in `make_head`, so it never depended on the init key. |
 | decay banks, 5,430 vs 2,456 (2.21x) | unaffected | re-measured identical, same reason. Also pinned by `pytest.approx(2.21, abs=0.01)`, so it cannot drift silently. |
@@ -62,9 +62,9 @@ Batch 1, greedy, `scripts/benchmark.py`. L2 budget 1,048,576 B.
 
 | preset | params | packed (int8) | state | B/token/layer | of L2 | I2 |
 |---|---|---|---|---|---|---|
-| `nano` | 2,107,460 | 2.11 MB | 8,192 B | 110,592 | 10.5% | PASS |
-| `mini` | 24,338,948 | 24.34 MB | 131,072 B | 720,896 | 68.8% | PASS |
-| `small` | 324,929,540 | 324.93 MB | 1,048,576 B | 3,538,944 | 337.5% | **FAIL** |
+| `nano` | 2,108,996 | 2.11 MB | 8,192 B | 110,592 | 10.5% | PASS |
+| `mini` | 24,345,092 | 24.35 MB | 131,072 B | 720,896 | 68.8% | PASS |
+| `small` | 324,954,116 | 324.95 MB | 1,048,576 B | 3,538,944 | 337.5% | **FAIL** |
 
 `small` is 325 M parameters, which is roughly 17 MB of dense int8 expert weights
 against a 1 MiB cache. The mixer is not the problem — it touches 524,288 B, 5.7x

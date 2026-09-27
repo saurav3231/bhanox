@@ -191,13 +191,31 @@ Three decisions, each of which is a way this could have gone wrong:
 | write to a temp file, then `os.replace` | a crash mid-write must not destroy the checkpoint that was already there |
 | parameters only, no recurrent state | keeps a checkpoint proportional to parameters rather than context, and stops a file's contents from depending on the batch size of the run that wrote it |
 
-The third has a consequence worth stating plainly: `from_pretrained` returns a
-model with an **empty** state, and resuming mid-sequence without carrying the
-state is a different computation. `forward` continues from existing state rather
-than resetting, so a trainer that keeps the recurrent buffers alongside the
-checkpoint gets a bit-exact resume. Both directions are pinned in
-`tests/test_checkpoint.py` — carrying it matches the uninterrupted run, and
-dropping it does not, so neither test can pass for the wrong reason.
+The walk found a discrepancy the hand-written count had missed, which is the
+argument for it arriving at this point rather than later. `param_count()`
+reported 2,107,460 values and omitted the gates' `tau_hi`/`tau_lo`/`salience`
+— 1,536 learned, trained parameters. The count is now 2,108,996, and
+`test_param_count_agrees_with_the_checkpoint_walk` pins the two together so a
+parameter cannot be counted in one place and missed in the other. What the
+checkpoint holds that the count does not is 32 values of `bank_rates`, a cached
+broadcast of `cfg.decay_rates`; it is pinned by name, so "derived from config"
+cannot become a place to hide a forgotten parameter.
+
+Note the two figures that are easy to confuse. The **packed** size in the
+benchmark tables is 1 byte per value — the int8 budget the model is designed
+against, and what `packed_nbytes()` means. A checkpoint **file** is float32 and
+is about 4x that. Both are honest; they answer different questions.
+
+The third decision above has a consequence worth stating plainly:
+`from_pretrained` returns a model with an **empty** state, and resuming
+mid-sequence without carrying the state is a different computation. `forward`
+continues from existing state rather than resetting, so a trainer that keeps the
+recurrent buffers alongside the checkpoint gets a faithful resume. Both
+directions are pinned in `tests/test_checkpoint.py` — carrying it matches the
+uninterrupted run, and dropping it does not, so neither test can pass for the
+wrong reason. The matching assertion is on the **weights** (`== 0.0`); the logits
+are compared with a documented float32 tolerance, because the two paths reach the
+same answer by summing in a different order and BLAS picks that order per build.
 
 ## Assembly
 
