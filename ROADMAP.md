@@ -283,6 +283,66 @@ function than the one `docs/benchmarks.md` measures, and the drift above is
 structural rather than a bug to be fixed — so there is no version of this that is
 made safe by tightening a tolerance.
 
+**Done ahead of M2 — the full-model gradient check.** `tests/test_model_gradients.py`,
+against the same `BhanoxMirror.step` the trainer will use.
+
+*Reachability* is the claim that matters most, because a parameter that never
+receives a gradient is not a crash: the loss falls, the trainer reports progress,
+and one part of the model stays at its initialisation forever. Measured on the
+tiny config — 40 of 42 tensors, 55,946 of 56,010 elements — with the only
+dead parameters being the two `salience` arrays already reported as inert. The
+same holds at nano, one inert array per layer. The test asserts on *every* tensor
+and names the eight structural groups explicitly, so an unclassified parameter
+fails rather than passing unexamined.
+
+*Correctness* needed a rule for where finite differences even apply, and the rule
+turned out to be structural rather than a property of the harness:
+
+> the loss is smooth in P only if nothing downstream of P performs an int state
+> write or a gate decision
+
+The last state write is inside the last layer's bank, so the provably smooth
+parameters are that bank's read-out and bypass, that layer's mixer, and the
+unembed: **51 probes, zero mismatches.** Everything earlier has a downstream
+staircase, and there the measurement is a *rate* rather than a pass — 12–25% of
+probes land on a staircase edge and disagree, the rest agree. The cap is the
+test: a genuinely wrong gradient disagrees on nearly every probe, so "mismatches
+stay a minority" separates a staircase from a bug. `embed.g` sits furthest
+upstream and mismatches outright.
+
+The gate thresholds are not finite-difference checkable at all, and the reason is
+worth stating so it is not mistaken for a gap in coverage. The mask is a hard
+decision, so the loss is *piecewise constant* in the thresholds — measured at four
+step sizes from 1e-1 to 1e-4, the finite difference never approaches the analytic
+value, and the residual does not shrink as the step does. Those two groups are
+verified by the governor's own component tests instead, where the mask is held
+fixed and the threshold's gradient is meaningful.
+
+The one finding that would have shipped as a bug report: with a *live* mask, the
+finite difference and the analytic gradient disagree by roughly 3x on the
+read-out. Freezing the mask takes it to 6/6. So the estimator is right, and the
+gap is the `d(mask)/d(param)` term — real, and deliberately not modelled, because
+modelling it would mean differentiating a comparison operator. The mask is a
+function of the very parameters being checked: it thresholds `abs(step_out)`, and
+`step_out` ends in `W_o`. Pinned as a live-versus-frozen contrast, because the
+naive version of this check reports a large, confident, entirely expected
+discrepancy that is indistinguishable from a gradient bug.
+
+Two harness bugs got there, and both are now tests:
+
+- `step` advances the int32 state in place, and `state_int` **is** a registered
+  buffer — so a snapshot written as "the float buffers" drops the entire
+  recurrent state. Every loss evaluation then started further along the
+  recurrence than the last, and all 32 quotients it reported were state drift
+  wearing the costume of gradients. The loss is now checked for idempotence
+  under a state restore, which is the precondition for everything else.
+- A positive control at the end scales the read-out and requires the check to
+  notice. It originally used a 1% error, which failed — correctly. A 1% error
+  falls below the `|loss| * eps / h` floor, so the method genuinely cannot
+  resolve it, and demanding that it catch one would be demanding a lie. At 50%
+  it is caught. A harness that cannot fail is not evidence of anything, and this
+  one had already produced 32 confident false mismatches.
+
 ## M3 — Model zoo, on Kaggle free tier
 
 **Status: not started.**
