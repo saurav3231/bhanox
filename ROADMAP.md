@@ -121,6 +121,37 @@ error on every activation gradient rescales `W_k`, `W_q` and `W_v` identically,
 so gradient directions stay plausible and the loss still falls — the only symptom
 is an effective learning rate nobody chose. It now has its own test.
 
+**Done ahead of M2 — the bookends.** `src/bhanox/train/bookend_mirror.py`: HashBind,
+layer norm and the unembedding. Small enough that there is nothing to hide a
+mistake in, which is exactly why they are worth doing first — anything that
+disagrees here is a bug in the mirror rather than a subtle difference in an
+idea. Agreement is a stated 1e-5 float tolerance; the worst observed is 9.6e-7.
+
+Two decisions worth keeping:
+
+- **The hash is shared with the reference, not reimplemented.** `hash_rows` calls
+  the reference's own method rather than porting `mix64` to torch. That is a
+  deliberate departure from "reproduce the reference independently", and it is
+  right for a specific reason: the hash is pure integer index arithmetic with
+  nothing to differentiate, so sharing it costs no gradient and removes a whole
+  class of silent divergence. A second implementation would agree on the
+  reference's test inputs and then scatter some other id, and there is no
+  aggregate for that to hide in — it is just one wrong token.
+- **Layer norm has no affine gain or bias**, and the reference exposes it as a
+  function. `nn.LayerNorm` defaults to `elementwise_affine=True`, so delegating
+  to it would have silently added `2 * d_model` parameters per call, changed the
+  parameter count, and granted a degree of freedom the architecture does not
+  have — while passing every forward agreement test with the weights still at
+  their initial values.
+
+Two failure modes the tests pin, both of which produce correct-looking forward
+passes: a negative id wrapping to `table[-1]` (a real learned vector, added to an
+unknown token's embedding, forever), and the direct table being used *instead of*
+rather than *in addition to* the hashed contribution. The pool's backward is a
+scatter-add, so the gradient test checks the untouched rows are exactly zero
+rather than just that the pool has a gradient — a front-end that updated all
+8,192 rows per token would defeat the memory saving the component exists for.
+
 **Deferred to M4: the D7 CLI.** The spec's example is`bhanox serve mini.nx --temp-mem 64MB --perm-mem 2GB --perm-storage disk`, and
 none of it exists — the repo has no entry point and no `serve` command. A serve
 loop and a disk-overflow store are runtime concerns, and M4 is where a runtime
