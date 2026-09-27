@@ -39,6 +39,8 @@ __all__ = [
     "quantize_activation_smooth",
     "sigmoid",
     "ste_clip",
+    "ste_ge",
+    "ste_gt",
     "ste_requantise",
     "ste_round",
 ]
@@ -146,6 +148,44 @@ def quantize_activation_smooth(x: Tensor) -> Tensor:
 def identity(x: Tensor) -> Tensor:
     """No quantisation at all. The pure float recurrence, for differentiation."""
     return x
+
+
+def ste_gt(margin: Tensor) -> Tensor:
+    """``margin > 0`` in the forward, unit gradient on ``margin`` in the backward.
+
+    This is the estimator for a *decision boundary* rather than a rounding
+    boundary, and the PulseGate thresholds are the only places the model has one.
+    Written against the signed margin rather than the pair of operands, so the
+    caller decides the sign convention and the gradient direction is a
+    consequence of it:
+
+        wake:  margin = delta - tau_hi   -> d margin / d tau_hi = -1
+        sleep: margin = tau_lo - delta   -> d margin / d tau_lo = +1
+
+    That matters because the gradient has to reach the *threshold*, not just the
+    input. An estimator written on ``delta`` alone -- ``ste_gt(delta)``, say --
+    would have the right forward value and no gradient on ``tau_hi`` at all,
+    leaving both thresholds frozen while the loss falls and every agreement test
+    still passes.
+
+    The forward value is exactly 0.0 or 1.0, so callers can combine these with
+    ordinary ``min``/``max``/``*`` and reproduce boolean logic exactly, carrying a
+    graph alongside it.
+    """
+    return _ste(margin, (margin > 0).to(margin.dtype))
+
+
+def ste_ge(margin: Tensor) -> Tensor:
+    """``margin >= 0`` in the forward, unit gradient on ``margin``.
+
+    Distinct from :func:`ste_gt` because the reference uses both comparisons and
+    they are not interchangeable at the boundary: the PulseGate's quiet counter
+    sleeps on ``_quiet >= sleep_after`` while it wakes on ``delta > tau_hi``.
+    Collapsing them to one strict comparison would make the gate sleep a step
+    late, and the error would be invisible in aggregate -- it would just look
+    like a slightly different skip rate.
+    """
+    return _ste(margin, (margin >= 0).to(margin.dtype))
 
 
 def l2_normalize(x: Tensor, eps: float = 1e-6) -> Tensor:

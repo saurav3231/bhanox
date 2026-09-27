@@ -96,6 +96,7 @@ it) or `modeled` (a component model, not an end-to-end measurement).
 | Decay banks vs single decay (state energy) | 5,430 vs 2,456 (2.2x) | **measured** | `test_decay_banks_outlast_a_single_fast_decay` |
 | PulseGate compute skipped, steady input | 75% | **measured** | `test_steady_input_is_mostly_skipped` |
 | PulseGate compute skipped, random input | 0% | **measured** | `test_noisy_channel_never_sleeps` |
+| PulseGate `salience` params that can never get a gradient | 512 (nano), 0.024% of params | **measured** | `test_salience_is_inert` |
 | MicroExpert bytes/token vs dense | 5.7x fewer | **measured** | `test_touches_far_fewer_bytes_than_dense` |
 | Batch-1 tokens/sec, NumPy reference | ~51 t/s (32 tokens, greedy) | **measured** | `scripts/benchmark.py` |
 | P1 speed gate (>= 20,000 t/s) | **NOT MEASURED** — native runtime is M4 | — | — |
@@ -132,6 +133,12 @@ equivalent. That is reported honestly rather than tuned away; see ADR-003.
 
 I4 has no native runtime to compare against until M4, so the test exists and is
 skipped with that reason rather than being quietly omitted.
+
+One honest defect is reported rather than papered over: `PulseGate.salience` is
+allocated, counted and checkpointed but never read, so its 512 nano values can
+never receive a gradient. The training mirror reproduces that faithfully and pins
+it with a test, because "fixing" it would change which channels are protected and
+would invalidate the measured skip rates above. See the ROADMAP.
 
 ---
 

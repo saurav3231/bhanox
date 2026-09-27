@@ -127,6 +127,64 @@ loop and a disk-overflow store are runtime concerns, and M4 is where a runtime
 gets built, so the CLI belongs there rather than growing a second surface now
 and rewriting it later. D7 ships as a library API, which is complete and tested.
 
+**Found while mirroring: `PulseGate.salience` is dead weight.** The gate
+allocates, counts and checkpoints a per-channel `salience` array, and never reads
+it. `step()` takes a `gate_magnitude` argument, ranks *that* in `_protected`, and
+ignores `self.salience` entirely — and both call sites in `model.py` pass
+`np.abs(step_out)`. So the array cannot change any output and can never receive a
+gradient, while the optimizer would dutifully update all of it forever. At nano
+that is 512 of the gate's 1,536 counted values, 0.024% of the model's 2,108,996
+parameters.
+
+The mirror reproduces the bug rather than fixing it, which is the only defensible
+option here. Reading `salience` in `_protected` is an architecture change to a
+frozen spec; it would change which channels are protected, and it would silently
+invalidate the measured 0.54 skip rate at 0.34% error. So the bug is pinned by
+`test_salience_is_inert` (changing it must not change any output, and it must
+never receive a gradient), the mirror's `repr` says `salience_inert=True`, and the
+trainer will exclude it from AdamW. If that test ever fails, the ROADMAP, the byte
+accounting and the measured claims all have to be revisited together.
+
+**Done ahead of M2 — the PulseGate mirror.** `src/bhanox/train/governor_mirror.py`,
+agreed against the numpy reference bit-exactly on the mask *and* on every piece
+of integer state — the cache, the awake mask, the quiet counter, `_has_run`, and
+the four event counters. That is a stronger claim than the DeltaBank and
+MicroExpert mirrors make, and it is the only one available: a boolean state
+machine has no float to be within a tolerance of, so "bit-exact" and "a plausible
+skip rate" are otherwise indistinguishable.
+
+Writing it turned up two bugs in my own first draft that the aggregate skip rate
+hid completely, which is why they are worth writing down:
+
+- The quiet counter is `np.where(quiet, count + 1, 0)` — a loud step **resets**
+  it. Read as `count + quiet` ("increment when quiet"), a loud step instead
+  *leaves the count alone*, so a channel that slept twice, took one big kick, and
+  should now be wide awake still reads 2 and falls straight back to sleep. It then
+  skips every other step forever while the overall skip rate looks perfectly
+  plausible throughout. 124 of 384 channels diverged at step 2.
+- `protected` belongs in the wake condition, not only in the sleep condition: the
+  reference wakes on `(delta > tau_hi) | protected`. A mirror that omits it looks
+  correct for the loud channels — which is to say for most protected channels,
+  since the largest gate magnitudes usually also move the most — and quietly
+  strands the small protected ones. It surfaced as 9 of 384 channels, one step
+  later than the first bug and only because the first one was fixed.
+
+The third trap is a gradient one, and it is why the counter is rebuilt rather than
+detached. `_quiet` is integer state, so detaching it before comparing against
+`sleep_after` gives a correct forward and a **permanently zero `tau_lo` gradient**
+— a threshold that looks trained and never moves. The counter is therefore rebuilt
+as a hard value and re-anchored (`q_value + (ste - ste.detach())`), so the forward
+is the reference's and the gradient to `tau_lo` survives. Both thresholds now get
+non-zero gradient, checked over a sequence because the first step legitimately has
+none: `compute = np.where(has_run, awake, True)` makes the mask the constant 1.0
+until a sample has run once.
+
+`ste_gt` and `ste_ge` are kept separate because the reference uses both and they
+are not interchangeable at the boundary: the gate wakes on `delta > tau_hi` but
+sleeps on `_quiet >= sleep_after`. Collapsing them to one strict comparison makes
+the gate sleep a step late, and the error is invisible in aggregate — it just
+looks like a slightly different skip rate.
+
 ## M3 — Model zoo, on Kaggle free tier
 
 **Status: not started.**
