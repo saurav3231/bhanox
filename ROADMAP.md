@@ -105,9 +105,21 @@ post-quantization loss.
 
 One implementation trap, recorded because it fails silently: the NumPy form
 `x + (rint(x) - x)` has no graph to preserve, but the same expression in Torch
-has gradient **2**, not 1. The mirror needs `x + (rint(x) - x).detach()`.
-`d(ste_round)/dx == 1` is a claim, so it is checked by
-`src/bhanox/train/gradcheck.py` rather than asserted in a comment.
+has gradient **0**, not 1, and certainly not the **2** an earlier draft of this
+file claimed. `round` has no derivative, so the two terms cancel and the STE
+becomes a no-op that raises nothing. The mirror needs
+`x + (round(x) - x).detach()`. `d(ste_round)/dx == 1` is a claim, so it is
+checked by `src/bhanox/train/gradcheck.py` rather than asserted in a comment.
+
+A second trap, found by finite-differencing the mirror and much harder to see:
+the activation quantiser must be a *single* straight-through, not
+`ste_requantise(ste_round(x * 127))`. That composition yields `d k_f / dk == 127`,
+because the round passes the multiply's 127 through and the requantise adds
+another 1. It is wrong because in the float recurrence the quantiser has already
+been rounded away, so `k_f` stands in for `k` and its derivative is 1. A 127x
+error on every activation gradient rescales `W_k`, `W_q` and `W_v` identically,
+so gradient directions stay plausible and the loss still falls — the only symptom
+is an effective learning rate nobody chose. It now has its own test.
 
 **Deferred to M4: the D7 CLI.** The spec's example is`bhanox serve mini.nx --temp-mem 64MB --perm-mem 2GB --perm-storage disk`, and
 none of it exists — the repo has no entry point and no `serve` command. A serve

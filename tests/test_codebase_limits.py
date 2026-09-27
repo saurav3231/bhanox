@@ -140,8 +140,15 @@ class TestModuleSizeDoctrine:
 
 class TestNumpyOnlyRuntime:
     def test_no_forbidden_import_in_the_package(self) -> None:
+        # C8 and C9 are two halves of one statement: numpy is the only runtime
+        # dependency, and torch is permitted in exactly one package. Applying C8
+        # to ``train/`` as well would contradict C9 and make the training extra
+        # unimplementable -- the carve-out below is C9's, and C8 is what governs
+        # everything else.
         offenders: dict[str, set[str]] = {}
         for p in PACKAGE_MODULES:
+            if p.relative_to(SRC).as_posix().startswith(TORCH_ALLOWED_ROOT):
+                continue
             bad = _imports(p) & FORBIDDEN_RUNTIME
             if bad:
                 offenders[p.relative_to(ROOT).as_posix()] = bad

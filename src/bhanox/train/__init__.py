@@ -10,8 +10,10 @@ Two pieces, in the order they have to exist:
 - :mod:`bhanox.train.gradcheck` -- finite-difference gradient checks. This is
   the thing that has to be right before any weight is trained, because a wrong
   gradient produces a model that looks like it is learning and is not.
-- the torch mirror of the forward pass, checked against the numpy reference,
-  and then the training loop on top of it. Neither exists yet.
+- :mod:`bhanox.train.mirror` -- the torch mirror of the forward pass, checked
+  against the numpy reference. Currently
+  :class:`~bhanox.core.deltabank.DeltaBankHead` only; the rest of the model, the
+  gate, the router, and the training loop are not written yet.
 
 The mirror is not optional bookkeeping. If it drifts from the numpy reference
 even slightly, training optimizes a different function than the one the
