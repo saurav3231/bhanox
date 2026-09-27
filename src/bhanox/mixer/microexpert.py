@@ -20,8 +20,16 @@ it.
 
 Bytes touched per token: ``(n_shared + top_k) * (2 * d_model * d_expert)``
 int8 weights, versus ``2 * d_model * (n_experts + n_shared) * d_expert`` for a
-dense FFN of the same total capacity. At nano that is 5.3x fewer bytes, and the
-gap widens with scale.
+dense FFN of the same total capacity. At nano that is 17/3 = 5.67x fewer bytes,
+and the gap widens with scale.
+
+A correction worth recording, because the number used to be quoted as 5.3x. That
+figure came from counting the shared expert on the *active* side while omitting
+it from the *dense* side -- 16 routed experts over an active count that included
+the shared one. The two sides have to be measured over the same set of weights or
+the ratio means nothing. :meth:`MicroExpertLayer.dense_nbytes` uses
+``total_experts`` for exactly this reason, and the like-for-like figure is
+``n_total / (n_shared + top_k)``.
 """
 
 from __future__ import annotations
@@ -323,8 +331,10 @@ class MicroExpertLayer:
     def active_nbytes(self) -> int:
         """int8 weight bytes touched per token.
 
-        This is the number the 5.3x MicroExpert claim is measured from, and it
-        is what :mod:`bhanox.audit` reports for invariant I2.
+        This is the *active* side of the density claim: ``n_shared + top_k``
+        experts' worth of weights, since the shared expert always runs and
+        ``top_k`` routed experts are gathered. It is what :mod:`bhanox.audit`
+        reports for invariant I2.
         """
         cfg = self.config
         per_expert = 2 * cfg.d_model * cfg.d_expert
