@@ -35,6 +35,17 @@ from bhanox.model import Bhanox
 
 IDS = np.arange(1, 24, dtype=np.int64)
 
+#: Logit tolerance for comparing two *different execution orders* of the same
+#: arithmetic. Step-then-forward and forward-the-whole-sequence reach the same
+#: answer by summing the same products in a different order, and BLAS picks that
+#: order per build: bit-identical on the 3.12 runner, ~5e-7 apart on 3.11.
+#: This is a float32 claim, not a checkpoint claim -- the weights themselves are
+#: held to exact equality below, and they are what the checkpoint promises.
+#:
+#: The converse test pins that this is not so loose that it stops
+#: discriminating: dropping the state moves the logits by ~2.9, not by 1e-4.
+LOGIT_TOL = 1e-4
+
 
 def nano() -> Bhanox:
     return Bhanox(load_config("nano"))
@@ -101,6 +112,39 @@ class TestInventory:
         """A stable order makes two checkpoints of the same model diffable."""
         assert [n for n, _ in inventory(nano())] == [n for n, _ in inventory(nano())]
 
+    def test_param_count_agrees_with_the_checkpoint_walk(self) -> None:
+        """The size claim and the set of saved tensors are derived independently,
+        which is the setup for a silent divergence: a parameter counted in one
+        place and not the other yields either a file that loads into a subtly
+        different model or a headline number that is quietly wrong. The gate
+        thresholds were the live instance -- learned, trained, and missing.
+
+        The walk is the authority here, because it is what actually ships.
+        """
+        model = nano()
+        learned = [
+            arr for name, arr in inventory(model) if not name.endswith("bank_rates")
+        ]
+        assert model.param_count() == sum(int(a.size) for a in learned)
+
+    def test_the_only_uncounted_arrays_are_config_derived(self) -> None:
+        """Pin the exception, so "derived from config" cannot quietly become a
+        dumping ground for parameters nobody remembered to count. Anything the
+        walk finds beyond the count has to be on this list, by name.
+        """
+        model = nano()
+        extra = [n for n, _ in inventory(model) if n.endswith("bank_rates")]
+        assert extra == [
+            f"deltabanks[{i}].bank_rates" for i in range(len(model.deltabanks))
+        ]
+        assert sum(int(a.size) for _, a in inventory(model)) - model.param_count() == 32
+
+    def test_gates_are_counted(self) -> None:
+        """The specific regression: the gates' per-channel thresholds are
+        learned and trained, and were absent from the count.
+        """
+        assert sum(g.param_count() for g in nano().gates) == 1536  # 4 x 3 x 128
+
     @pytest.mark.parametrize(
         "name,expected",
         [
@@ -161,9 +205,13 @@ class TestRoundTrip:
     def test_carrying_the_state_across_a_resume_is_exact(self, saved: Path) -> None:
         """The checkpoint holds weights, not state -- but ``forward`` continues
         from existing state rather than resetting, so a caller that carries the
-        recurrent buffers alongside the checkpoint gets a bit-exact resume. This
+        recurrent buffers alongside the checkpoint gets a faithful resume. This
         is why the state does not have to live in the file, and it is the
         contract the trainer will rely on.
+
+        The weights are checked for exact equality. The logits are not, and
+        cannot be: this compares two execution orders, not two models. See
+        ``LOGIT_TOL``.
         """
         head, tail = IDS[:10], IDS[10:]
         whole = nano()
@@ -171,14 +219,22 @@ class TestRoundTrip:
 
         resumed = nano()
         load(saved, resumed)
+        assert worst_diff(whole, resumed) == 0.0, "weights are not bit-exact"
         for t in head:
             resumed.step(int(t))
-        assert np.array_equal(resumed.forward(tail), expected)
+        got = resumed.forward(tail)
+        assert np.allclose(
+            got, expected, rtol=LOGIT_TOL, atol=LOGIT_TOL
+        ), f"max|diff| = {float(np.abs(got - expected).max())}"
 
     def test_dropping_the_state_changes_the_result(self, saved: Path) -> None:
         """The converse, so the test above cannot pass for the wrong reason: a
         resume that loses the recurrent buffer is a different computation, and
         silently so.
+
+        Also the guard on ``LOGIT_TOL``. If that tolerance were loose enough to
+        accept a lost state, this test would fail -- which is what stops the pair
+        from degrading into two tests that always pass.
         """
         head, tail = IDS[:10], IDS[10:]
         whole = nano()
@@ -186,7 +242,12 @@ class TestRoundTrip:
 
         lost = nano()
         load(saved, lost)  # weights restored, recurrent state left empty
-        assert not np.allclose(lost.forward(tail), expected)
+        got = lost.forward(tail)
+        drift = float(np.abs(got - expected).max())
+        assert not np.allclose(got, expected, rtol=LOGIT_TOL, atol=LOGIT_TOL), (
+            f"LOGIT_TOL={LOGIT_TOL} is too loose: a lost state only moved the "
+            f"logits by {drift}, so the exactness test proves nothing"
+        )
 
     def test_does_not_alias_the_saved_arrays(self, saved: Path) -> None:
         """Loading must copy, not rebind: writing to the model after a load has
