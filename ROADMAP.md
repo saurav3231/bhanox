@@ -79,8 +79,37 @@ temporary state and 14x on the vault, so implementing them literally would have
 violated D7's own "never OOM" rule on the first entry. See
 `docs/architecture.md` for the corrected formulas and what each knob is tied to.
 
-**Deferred to M4: the D7 CLI.** The spec's example is
-`bhanox serve mini.nx --temp-mem 64MB --perm-mem 2GB --perm-storage disk`, and
+**Settled: how training interacts with the int8 grid.** This had to be decided
+before the update rule, because it decides what the gradient even *is*.
+
+**Straight-through estimator, on a schedule.** The forward pass uses the
+quantized weights and the gradient passes through the quantizer as if it were
+identity, so what is optimized is what ships.
+
+That was not an open choice so much as a re-reading. The numerics layer already
+implements it — `ste_round`, `ste_quantize`, `ternary_quantize` in
+`src/bhanox/quant/numerics.py` — and `ternary_quantize` carries the reason: the
+sign function has zero derivative almost everywhere, so without the STE that
+regime has no gradient at all. The reference also already stores *dequantized*
+float32 weights and applies the int8 regime through an explicit `quantize()`
+call, so "on-grid" is the model's native representation rather than an extra
+approximation laid on top of it. Training in float and quantizing at save would
+mean optimizing a function the model never ships.
+
+The schedule is float warmup first, then quantized STE for the remainder. Pure
+STE from step 0 is the purest option and was the runner-up, but its gradient is
+a biased surrogate of a hard nonlinearity, and early steps tend to barely move.
+The cost of the schedule is that the loss reported during warmup is not the loss
+that ships, so it is labelled as such rather than being quietly charted beside
+post-quantization loss.
+
+One implementation trap, recorded because it fails silently: the NumPy form
+`x + (rint(x) - x)` has no graph to preserve, but the same expression in Torch
+has gradient **2**, not 1. The mirror needs `x + (rint(x) - x).detach()`.
+`d(ste_round)/dx == 1` is a claim, so it is checked by
+`src/bhanox/train/gradcheck.py` rather than asserted in a comment.
+
+**Deferred to M4: the D7 CLI.** The spec's example is`bhanox serve mini.nx --temp-mem 64MB --perm-mem 2GB --perm-storage disk`, and
 none of it exists — the repo has no entry point and no `serve` command. A serve
 loop and a disk-overflow store are runtime concerns, and M4 is where a runtime
 gets built, so the CLI belongs there rather than growing a second surface now
