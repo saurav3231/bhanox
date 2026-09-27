@@ -216,6 +216,73 @@ sleeps on `_quiet >= sleep_after`. Collapsing them to one strict comparison make
 the gate sleep a step late, and the error is invisible in aggregate — it just
 looks like a slightly different skip rate.
 
+**Done ahead of M2 — the assembled model mirror.** `src/bhanox/train/model_mirror.py`:
+`DeltaBankLayerMirror` and `BhanoxMirror`, wiring the five component mirrors
+together in the reference's block order (memory recurrence, then the mixer, then
+layer norm). Assembling them is where the agreement claims stop being
+component-local, and it is also where the first genuine limit of the whole
+approach turned up.
+
+One mirror was fixed on the way. `HashBindMirror.forward` used
+`torch.einsum("...hk,h->...k", gathered, self.g)`, and the mirror's front end was
+then *not* bit-exact against numpy — a one-ULP difference per output element,
+from a reduction order the reference does not use. Replacing it with an explicit
+loop over the `n_hashes` axis makes the front end bit-exact. Worth recording
+because it is the one case where the naive port was the less faithful one: the
+fix was to copy numpy's accumulation order, not to loosen a tolerance.
+
+The limit is this: **the reference's int8 state is not stable under ULP-level
+float perturbation.** The root cause is that torch's float32 GEMM is not
+bit-identical to numpy's — they are different BLAS builds. Measured here at
+1.1e-5 on a `(2, 128) @ (128, 128)` float32 product, which is a property of
+this machine rather than a number to quote as a spec, but the part that does
+not move is that it is non-zero at all.
+
+On top of that, `PulseGate` thresholds a float and has no dead band, so a
+one-ULP difference in an activation can flip a channel's mask, and the flip then
+compounds through the layer stack into O(1e-1) differences in the state. This was
+confirmed in the reference *alone*, with no mirror involved: perturbing one
+activation by 1–2 ULP between layers on Nano at `(8, 64)` changed 9 of 16 heads,
+875 of 65,536 state elements (1.335%), with a maximum state change of 13 — under a
+perturbation that also shifts the closest gate-threshold approach from 3.445e-5 to
+1.335e-5, i.e. closer to the boundary but not past it. Individual thresholds
+resisted a 1-ULP flip in the tested range; the accumulation is what escapes.
+
+A direct test pins the mechanism rather than the symptom. `PulseGate` starts
+asleep, and with the cache primed `delta == tau_hi` exactly. One ULP upward and
+all 8 channels wake. So there is no tolerance band to hide in, and no mirror can
+be held to a tighter claim than this allows.
+
+What the tolerances are, and what they are not:
+
+| Config | Head state bit-exact | Worst logit diff | Stated tolerance |
+|---|---|---|---|
+| Tiny, 2 layers, <= 64 tokens | 119 / 120 trials | 8.4e-6 | 1e-5 |
+| Nano, short windows `<= (4, 4)` | 70 trials, no state divergence | 1.25e-5 | 1e-4 |
+| Nano, isolated `(1, 8)` trial | head state exact, **gate state not** | 9.8e-4 | outside |
+
+So `1e-4` is a defensible full-model claim for the short-window regime it was
+measured in, and it is **not** a universal one — the third row is the same
+architecture and it misses by 10x. The tests therefore assert both directions: a
+correct state must agree inside tolerance, and a wrong state (a different
+sequence's state, or one int8 element nudged by +64) must *not*, by a wide
+margin. The second half is the half that stops tolerance from becoming a number
+that anything passes.
+
+The state comparisons also start from a seeded *non-zero* state, not from a fresh
+model. A fresh model has an all-zero int8 state, so a mirror that simply kept its
+own state at zero would pass every agreement test above while being unable to
+resume anything. `test_a_seeded_non_zero_state_is_reproduced` warms the reference
+up, hands the mirror that state, asserts the state was actually non-zero, and
+then checks the continuation — so a warmup that silently stopped writing state
+turns into a failure rather than a vacuous pass.
+
+This is the reason the training loop is written in torch rather than in the
+reference's float. A mirror that is only approximately right trains a different
+function than the one `docs/benchmarks.md` measures, and the drift above is
+structural rather than a bug to be fixed — so there is no version of this that is
+made safe by tightening a tolerance.
+
 ## M3 — Model zoo, on Kaggle free tier
 
 **Status: not started.**

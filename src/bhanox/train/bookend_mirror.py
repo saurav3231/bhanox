@@ -210,7 +210,22 @@ class HashBindMirror(nn.Module):
             )
         # ``(..., n_hashes, d_model)`` -- one gathered row per hash.
         gathered = self.pool[rows]
-        hashed = torch.einsum("...hk,h->...k", gathered, self.g)
+        # An explicit ordered accumulation, not ``einsum``. The reference computes
+        # this with ``np.einsum("...hk,h->...k", pool[rows], g, dtype=np.float32)``
+        # and torch's ``einsum`` contracts the same indices in a different order,
+        # which measured as exactly one ULP of disagreement per output element.
+        # Summing the ``n_hashes`` terms in index order reproduces numpy's result
+        # bit-for-bit on every case tried here; that ordering is the finding, and
+        # why it is spelled out as a loop rather than left to a library.
+        #
+        # This is the one place in the mirror where a plain-looking
+        # ``torch.einsum(...)`` substitution is quietly wrong, and the ULP it
+        # injects is one ULP into every downstream layer. A four-iteration Python
+        # loop is not a performance concern at ``n_hashes=4``; if that ever stops
+        # being true the answer is still to keep the loop.
+        hashed = torch.zeros(*gathered.shape[:-2], self.d_model, dtype=gathered.dtype)
+        for h in range(self.n_hashes):
+            hashed = hashed + gathered[..., h, :] * self.g[h]
 
         known = (arr >= 0) & (arr < self.vocab_table)
         # The index is clamped *and* the result is re-masked. Clamping alone is

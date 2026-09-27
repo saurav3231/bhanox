@@ -140,6 +140,17 @@ never receive a gradient. The training mirror reproduces that faithfully and pin
 it with a test, because "fixing" it would change which channels are protected and
 would invalidate the measured skip rates above. See the ROADMAP.
 
+A second limitation is measured rather than hidden: the reference's int8 state is
+not stable under ULP-level float perturbation. `PulseGate` thresholds a float
+with no dead band, so a one-ULP difference in an activation can flip a channel's
+mask, and the difference then compounds through the layer stack. The NumPy
+reference alone exhibits this when run with different reduction orders. It is why
+the component mirrors are bit-exact but the assembled mirror is only held to a
+stated float tolerance, and why the training loop is written in Torch rather than
+in the reference's float: a mirror that is only approximately right would train a
+different function than the one the benchmarks measure. See
+`src/bhanox/train/model_mirror.py`.
+
 ---
 
 ## Repository layout

@@ -5,7 +5,7 @@ importing it is what pulls torch in. Nothing under ``src/bhanox`` outside this
 directory may import torch, which is enforced by a test rather than by
 convention.
 
-Five pieces, in the order they have to exist:
+Six pieces, in the order they have to exist:
 
 - :mod:`bhanox.train.gradcheck` -- finite-difference gradient checks. This is
   the thing that has to be right before any weight is trained, because a wrong
@@ -29,8 +29,15 @@ Five pieces, in the order they have to exist:
   It also documents a spec bug it mirrors rather than fixes: the gate's
   ``salience`` array is allocated, counted and checkpointed but never read, so it
   can never receive a gradient.
+- :mod:`bhanox.train.model_mirror` -- the above, assembled in the reference's
+  block order. This is where the agreement claims stop being component-local, and
+  where the module docstring records the one thing worth knowing before trusting
+  any of it: the reference's int8 state is *not* stable under ULP-level float
+  perturbation, because PulseGate thresholds a float and has no dead band. Two
+  float implementations therefore agree exactly for a while and then diverge, and
+  that is a property of the frozen architecture rather than of any mirror.
 
-Not written yet: the assembled full-model mirror and the training loop itself.
+Not written yet: the training loop itself.
 
 
 The mirror is not optional bookkeeping. If it drifts from the numpy reference
