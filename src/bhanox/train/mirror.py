@@ -105,6 +105,32 @@ def _host(t: Tensor) -> np.ndarray:
     return t.detach().to("cpu").numpy()
 
 
+def _contract_k(state: Tensor, codes: Tensor) -> Tensor:
+    """``einsum("bkv,bk->bv", state, codes)`` in int64, portably.
+
+    This is the state read in the DeltaBank recurrence -- every state row
+    accumulated against one code -- and it was written as an integer
+    ``torch.einsum``. That works on CPU and **raises ``NotImplementedError`` on
+    CUDA**: ATen's einsum has no integral kernel, so the first real GPU training
+    run died in ``DeltaBankHeadMirror.step`` before the first loss was computed.
+    Nothing about the arithmetic is CUDA-specific; only the kernel was missing.
+
+    So it is spelled out as a broadcast multiply and a sum over the contracted
+    axis. Unlike the float paths in this file, that substitution is *exact* rather
+    than close: integer addition is associative and commutative with no rounding,
+    so the reduction order cannot change the answer, and every backend that can
+    multiply int64 can sum it. The magnitudes are ``127 * 127 * d_k`` (about
+    5.2e5 at ``nano``'s ``d_k=16``), so int64 has room to spare and no overflow
+    is reachable.
+
+    The float einsums elsewhere in this file stay einsums. Float contraction order
+    *does* change the result, so they are kept as written and pinned by the
+    tolerance tests in ``test_model_mirror.py``; this function is for the integer
+    path only, where there is nothing to be careful about.
+    """
+    return (state.to(torch.int64) * codes.to(torch.int64).unsqueeze(-1)).sum(dim=1)
+
+
 class DeltaBankHeadMirror(nn.Module):
     """Torch mirror of one :class:`DeltaBankHead`.
 
@@ -244,7 +270,9 @@ class DeltaBankHeadMirror(nn.Module):
         state = self.state_int[: x.shape[0]]
         k8, q8, v8 = self._codes(x)
 
-        # Integer einsum, not a float one. The magnitudes are small enough
+        # Integer contraction, not a float one, and via ``_contract_k`` rather
+        # than an integer ``torch.einsum`` -- see that function for why the CUDA
+        # backend cannot run the einsum form. The magnitudes are small enough
         # (127*127*d_k ~ 2.6e5) that int64 is exact, and staying in integers is
         # the only way "bit-exact" means anything: a float accumulation would
         # agree on almost every step and disagree on the ones that matter.
@@ -254,8 +282,8 @@ class DeltaBankHeadMirror(nn.Module):
         # float promotes the whole expression to float32. The values survive --
         # these magnitudes are exactly representable -- but the dtype does not,
         # and an integer path that quietly runs in float is not an integer path.
-        acc_q = torch.einsum("bkv,bk->bv", state.to(torch.int64), q8.to(torch.int64))
-        acc_k = torch.einsum("bkv,bk->bv", state.to(torch.int64), k8.to(torch.int64))
+        acc_q = _contract_k(state, q8)
+        acc_k = _contract_k(state, k8)
         # Floor division, matching numpy's ``//``. Torch's ``//`` floors on
         # integer tensors (unlike C), and the accumulators go negative.
         e8 = torch.clamp(v8 - acc_k // MAX8, -128, 127)
@@ -410,9 +438,7 @@ class DeltaBankHeadMirror(nn.Module):
             # Only the write-side codes are needed here; the read happened above,
             # in the surrogate, and the two must not disagree about it.
             k8, _q8, v8 = self._codes(x)
-            acc_k = torch.einsum(
-                "bkv,bk->bv", state_int.to(torch.int64), k8.to(torch.int64)
-            )
+            acc_k = _contract_k(state_int, k8)
             e8 = torch.clamp(v8 - acc_k // MAX8, -128, 127)
             new_int = self._write_int(state_int, k8, e8, v8, bank_rates)
             self.state_int[: x.shape[0]] = new_int

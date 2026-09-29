@@ -1085,3 +1085,91 @@ def test_no_hot_path_tensor_is_created_without_a_device() -> None:
     assert (
         not offenders
     ), "device-less tensor creation on the training path: " + "; ".join(offenders)
+
+
+def test_no_integer_einsum_on_the_training_path() -> None:
+    """No integral ``torch.einsum`` anywhere in ``bhanox.train``.
+
+    The first real GPU training run died here. ``DeltaBankHeadMirror`` accumulated
+    its integer state read with ``torch.einsum("bkv,bk->bv", state, codes)`` in
+    int64, which runs fine on CPU and raises ``NotImplementedError`` on CUDA,
+    because ATen's einsum has no integral kernel. Every local test passed, every
+    CPU smoke passed, and the failure only appeared on a T4.
+
+    A behavioural test cannot catch that on a CPU-only host -- the same blind spot
+    as the source test above, so this reads the source. The assertion is
+    deliberately narrow: only *integral* einsums are forbidden, and only in
+    ``bhanox.train``. The float einsums in ``bookend_mirror`` and ``mixer_mirror``
+    stay, because float contraction order changes the result and those are pinned
+    by tolerance tests instead. The integer path is spelled out by
+    ``_contract_k``, which is exact -- integer addition is associative, so the
+    reduction order cannot change the answer.
+
+    Verified to fail when ``_contract_k`` is reverted to an integer einsum, and to
+    pass on the current source.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "bhanox" / "train"
+    int_dtypes = {"int8", "int16", "int32", "int64", "uint8"}
+    offenders: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "einsum"
+            ):
+                continue
+            # An einsum is integral if either operand is cast to an integer dtype.
+            integral = any(
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "to"
+                and inner.args
+                and isinstance(inner.args[0], ast.Attribute)
+                and inner.args[0].attr in int_dtypes
+                for arg in node.args
+                for inner in ast.walk(arg)
+            )
+            if integral:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        "integral torch.einsum on the training path, which has no CUDA kernel: "
+        + "; ".join(offenders)
+        + " -- use mirror._contract_k instead"
+    )
+
+
+def test_contract_k_is_exact_against_numpy_einsum() -> None:
+    """``_contract_k`` must equal the einsum it replaced, exactly, on every shape.
+
+    The substitution is only safe because integer addition is associative and
+    commutative with no rounding, so reduction order cannot change the answer.
+    This is what makes that claim checkable rather than merely plausible: it
+    compares against the real einsum and the real numpy reference over random
+    shapes rather than trusting the argument.
+    """
+    from bhanox.train.mirror import _contract_k
+
+    generator = torch.Generator().manual_seed(0)
+    for _ in range(200):
+        batch = int(torch.randint(1, 3, (1,), generator=generator))
+        buckets = int(torch.randint(1, 33, (1,), generator=generator))
+        width = int(torch.randint(1, 65, (1,), generator=generator))
+        state = torch.randint(
+            -128, 128, (batch, buckets, width), dtype=torch.int32, generator=generator
+        )
+        codes = torch.randint(-127, 128, (batch, buckets), generator=generator)
+
+        result = _contract_k(state, codes)
+        assert result.dtype == torch.int64
+        assert result.shape == (batch, width)
+
+        by_torch = torch.einsum(
+            "bkv,bk->bv", state.to(torch.int64), codes.to(torch.int64)
+        )
+        assert torch.equal(result, by_torch), "diverged from torch.einsum"
+        by_numpy = np.einsum(
+            "bkv,bk->bv", state.numpy().astype(np.int64), codes.numpy().astype(np.int64)
+        )
+        assert np.array_equal(result.numpy(), by_numpy), "diverged from np.einsum"
