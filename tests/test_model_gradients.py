@@ -18,19 +18,26 @@ answer is structural rather than a limitation of the harness:
 
 The last state write is inside the last layer's bank, so the provably smooth
 parameters are the last bank's read-out and bypass, the last mixer, and the
-unembed -- 56 probes, no mismatches. Everything earlier has a downstream
-staircase, and finite differences there are unreliable rather than wrong: a
-minority of probes land on a staircase edge and disagree, the rest agree.
+unembed -- 40 probes, no mismatches. Everything earlier has a downstream
+staircase, and finite differences there are unreliable rather than wrong: at the
+default step the edges are crossed too rarely to see (0 of 24), and at a
+ten-times-wider step the probes that disagree are exactly the ones whose +/- pair
+crossed a boundary. That containment is asserted directly, because a
+mismatch-rate cap is also satisfied by a broken harness.
 
 The gate adds a second, separate effect. The mask is a function of the very
 parameters whose gradient is being checked -- it thresholds ``abs(step_out)``,
 and ``step_out`` ends in ``W_o`` -- so the true loss has a ``d(mask)/d(W_o)``
-term that the straight-through estimator omits on purpose. Comparing the two
-without accounting for it produces confident nonsense: the first version of this
-file reported 32 mismatches from a harness bug, and the second reported 32 more
-that were a real and intended difference. Both are pinned as tests now, because
-a gradient harness that cannot demonstrate it detects agreement is not evidence
-of anything -- see the positive control at the bottom.
+term that the straight-through estimator omits on purpose. Note this is a
+surrogate term, not a discontinuity: the live mask skips a measured 30% of
+channels but does not flip under the perturbation at any step size tried, so the
+loss is locally constant in that respect and the estimator simply over-counts.
+Comparing live against frozen without accounting for it produces confident
+nonsense: the first version of this file reported 32 mismatches from a harness
+bug, and the second reported 32 more that were a real and intended difference.
+Both are pinned as tests now, because a gradient harness that cannot demonstrate
+it detects agreement is not evidence of anything -- see the positive control at
+the bottom.
 
 The harness also has a silent trap worth naming. ``step`` advances the int32
 recurrent state in place, so a loss evaluated twice from a stale state is a
@@ -443,25 +450,70 @@ def test_earlier_blocks_disagree_only_at_staircase_edges():
     """Where finite differences are unreliable, and the discriminator.
 
     A parameter with a downstream int state write is piecewise constant, so most
-    probes land inside a step and agree, and a minority land on an edge and
-    disagree. Measured: 8 mismatches out of 64 probes across four parameters.
+    probes land inside a step and agree, and the ones that straddle an edge
+    disagree. Measured: at the default step the edges are too rare to see (0 of
+    24), which is what the previous cap-based version of this test was silently
+    relying on -- a cap that any gradient, correct or not, passes when the
+    denominator is small. So the step is widened to 1e-2, where edges are
+    actually crossed, and the assertion is strengthened from a rate to
+    containment.
 
-    The cap is the test. A genuinely wrong gradient in these would disagree on
-    nearly every probe, so "mismatches are a minority" separates a staircase from
-    a bug. It is a cap and not a zero because the honest number is not zero.
+    The strong claim is not "few disagree" but "every probe that disagrees is a
+    probe that straddled a hard boundary". A wrong gradient in these parameters
+    would disagree on smooth probes too, and that is what this rules out.
     """
+    step = 1e-2
+    total_mismatched = 0
     for name in STAIRCASE:
-        results = _probes(name, count=PROBES)
-        counts = _verdicts(results)
-        checked = counts.get("ok", 0) + counts.get("mismatch", 0)
-        assert (
-            checked >= 4
-        ), f"{name}: too few resolvable probes to mean anything: {counts}"
-        bad = counts.get("mismatch", 0)
-        assert bad < 0.4 * checked, (
-            f"{name}: {bad}/{checked} probes mismatch. A minority is the staircase; "
-            f"a majority would be a wrong gradient."
+        results = _probes(name, count=PROBES, step=step)
+        disc = _continuity(name, freeze=True, count=PROBES, step=step)
+        mismatched = {r.index for r in results if r.verdict == "mismatch"}
+        straddling = {i for i, d in disc.items() if d}
+        unexplained = mismatched - straddling
+        assert not unexplained, (
+            f"{name} at step={step}: {len(unexplained)} probe(s) disagree while the "
+            f"+/- pair stayed smooth at indices {sorted(unexplained)} -- that is a "
+            f"real gradient error, not a staircase"
         )
+        total_mismatched += len(mismatched)
+    assert total_mismatched, (
+        f"no staircase probe disagreed even at step={step}, so this test is "
+        f"vacuous: the cap it replaces is passing for the wrong reason"
+    )
+
+
+def test_a_discontinuity_is_never_excused_as_a_staircase():
+    """The converse guard: 'staircase' must not become a blanket excuse.
+
+    A harness that classifies probes as continuous, then quietly excuses any
+    disagreement, proves nothing. So widen the step far enough that truncation
+    error swamps the derivative in the *smooth* parameters too, and check the
+    two sets are told apart: the smooth parameters genuinely never straddle a
+    boundary, so their disagreement at a huge step is the honest finite
+    difference failing, not the staircase being invoked after the fact.
+
+    The second half is what keeps the first honest. Asserting only "no smooth
+    parameter straddles" would also be satisfied by a harness where nothing
+    disagrees at any step -- measured, 0.5 does produce smooth-set mismatches --
+    so the label is shown to be doing real work rather than always answering
+    "no".
+    """
+    step = 0.5
+    guard = 3
+    for name in SMOOTH:
+        disc = _continuity(name, freeze=True, count=guard, step=step)
+        straddling = {i for i, d in disc.items() if d}
+        assert not straddling, (
+            f"{name}: {len(straddling)} probe(s) straddle a hard boundary at "
+            f"step={step}, so this set is not smooth and calling its mismatches "
+            f"truncation error would be wrong"
+        )
+    sample = _probes(SMOOTH[0], freeze=True, count=2, step=step)
+    assert _verdicts(sample).get("mismatch", 0), (
+        f"{SMOOTH[0]} agrees with its own gradient even at step={step}, so the "
+        f"continuity classification is never actually load-bearing and the "
+        f"guard above cannot distinguish anything"
+    )
 
 
 def test_the_thresholds_are_not_finite_difference_checkable():
@@ -469,10 +521,9 @@ def test_the_thresholds_are_not_finite_difference_checkable():
 
     The mask is a hard decision, so the loss is piecewise constant in the
     thresholds: a perturbation either changes nothing at all or flips a channel.
-    Measured at four step sizes from 1e-1 down to 1e-4, the finite difference
+    Measured at three step sizes spanning 1e-1 down to 1e-4, the finite difference
     never comes near the analytic gradient, and the residual does not shrink as
     the step does.
-
     This is not a gap dressed up as a pass. It is why those two groups are
     verified by the governor's own component tests, where the mask is held fixed
     and the threshold's gradient is meaningful.
@@ -502,10 +553,12 @@ def test_the_estimator_omits_the_mask_derivative_on_purpose():
     """The live-versus-frozen contrast, stated as the difference it is.
 
     With the live mask the finite difference and the analytic gradient disagree
-    by roughly 3x on the read-out. With the mask frozen they agree exactly. That
-    difference *is* the ``d(mask)/d(param)`` term: real, and deliberately not
+    on most probes; with the mask frozen they all agree. That difference *is*
+    the ``d(mask)/d(param)`` surrogate term: real, and deliberately not
     modelled, because modelling it would mean differentiating a comparison
-    operator.
+    operator. The magnitude is not quoted because it moved substantially when
+    the projection scales were corrected, and a stale factor here is exactly
+    the kind of number that quietly stops meaning anything.
 
     Pinning it matters because the naive version of this check -- live mask, no
     explanation -- reports a large, confident, entirely expected discrepancy that
@@ -548,54 +601,291 @@ def test_the_freeze_really_removes_the_masks_dependence_on_its_input():
         ), "the frozen mask still depends on its input"
 
 
+# -- is each probe even applicable? ---------------------------------------------
+
+
+def _fingerprint(mir: BhanoxMirror, masks: list) -> np.ndarray:
+    """Everything a hard decision could change: the int32 state and the masks.
+
+    Comparing this between the ``+h`` and ``-h`` evaluations of one probe is
+    what makes "discontinuous" a measurement rather than an assumption about
+    which parameters happen to sit upstream of a state write.
+    """
+    parts = [
+        t.detach().cpu().numpy().reshape(-1).copy()
+        for _, t in sorted(mir.named_buffers())
+        if t.dtype == torch.int32
+    ]
+    parts += [np.asarray(m.detach().cpu().numpy()).reshape(-1) for m in masks]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float64)
+
+
+def _continuity(
+    name: str, *, freeze: bool, count: int, step: float = DEFAULT_STEP
+) -> dict[int, bool]:
+    """Per sampled index: did the +/- pair straddle a hard boundary?
+
+    A central difference over an interval that contains a discontinuity is not
+    a small-inaccurate estimate, it is the average slope across a jump. So each
+    probe has to be classified before its quotient means anything, and the
+    classification is: compare the int32 state and the gate masks produced at
+    ``+h`` and ``-h``. Equal means the path between them was smooth.
+
+    Note that ``freeze=True`` replaces ``gate.forward`` wholesale, so no mask is
+    recorded and only the state write can be detected. That is the honest
+    reading: the frozen model has no gate decision left to straddle, which is
+    precisely what makes its finite differences meaningful.
+    """
+    from bhanox.train.gradcheck import _sample_indices
+
+    vocab = TINY.output_vocab
+    ids, target = _ids(vocab, 0), torch.from_numpy(_ids(vocab, 1).reshape(-1))
+    mir = _build(freeze=freeze)
+    saved = _capture(mir)
+    params = dict(mir.named_parameters())
+    arr = params[name].detach().cpu().numpy().copy()
+
+    masks: list = []
+    for gate in mir.gates:
+        inner = gate.step
+
+        def spy(a, b, _inner=inner):
+            m = _inner(a, b)
+            masks.append(m.detach().clone())
+            return m
+
+        gate.step = spy  # type: ignore[method-assign]
+
+    def at(a: np.ndarray) -> tuple[float, np.ndarray]:
+        _restore(mir, saved)
+        masks.clear()
+        with torch.no_grad():
+            params[name].copy_(torch.from_numpy(a))
+            value = float(_loss(mir, ids, target))
+        return value, _fingerprint(mir, masks)
+
+    out: dict[int, bool] = {}
+    for i in _sample_indices(arr.size, count, 0):
+        plus_arr, minus_arr = arr.copy(), arr.copy()
+        plus_arr.reshape(-1)[i] += step
+        minus_arr.reshape(-1)[i] -= step
+        _, fp_plus = at(plus_arr)
+        _, fp_minus = at(minus_arr)
+        out[int(i)] = not np.array_equal(fp_plus, fp_minus)
+    return out
+
+
+def test_every_provably_smooth_probe_is_actually_continuous():
+    """The smooth region's real evidence is continuity, not a mismatch count.
+
+    The previous version of this file asserted "0 mismatches" over the smooth
+    set and stopped there. That is a necessary condition and not a sufficient
+    one: zero mismatches is also what you get from a harness that probes nothing,
+    or from one whose quotients land in the noise floor. So the strong claim is
+    made directly -- across the sampled probes, no +/- pair changes the integer
+    state or the gate mask, which is what licenses the quotient in the first
+    place. Counts come second.
+    """
+    for name in SMOOTH:
+        broken = [
+            i
+            for i, disc in _continuity(name, freeze=True, count=PROBES).items()
+            if disc
+        ]
+        assert not broken, (
+            f"{name}: {len(broken)} of {PROBES} probes straddle a hard boundary "
+            f"at indices {broken}, so their quotients are not derivatives"
+        )
+
+
+def test_the_mask_gate_is_measurably_active_but_not_discontinuous_here():
+    """The live/frozen gap is a surrogate term, not a discontinuity.
+
+    An earlier version of this test asserted that turning the live gate on makes
+    a mask *flip* under the perturbation. It does not -- not at 1e-3, and not at
+    0.5 either. So the usual story ("the loss is piecewise constant, the
+    derivative does not exist") is the wrong explanation for this gap, and
+    asserting it was asserting a falsehood that happened to pass on other
+    platforms.
+
+    What is actually going on: the live mask skips a real fraction of channels
+    (measured below), so the straight-through term ``step_out * (compute -
+    compute.detach())`` contributes a genuine non-zero gradient, while adding
+    exactly zero to the forward value. The true derivative of that locally
+    constant mask is zero, so the estimator over-counts here by design. Freezing
+    the mask sets ``compute`` to 1, which zeroes that surrogate term and restores
+    agreement. Both facts are asserted, so this test now fails loudly if the
+    gate ever becomes trivial or genuinely discontinuous.
+    """
+    name = "banks.1.W_o"
+    mir = _build(freeze=False)
+    seen: list = []
+    for gate in mir.gates:
+        inner = gate.step
+
+        def spy(a, b, _inner=inner):
+            m = _inner(a, b)
+            seen.append(m.detach().clone().reshape(-1).cpu().numpy())
+            return m
+
+        gate.step = spy  # type: ignore[method-assign]
+    saved = _capture(mir)
+    _restore(mir, saved)
+    vocab = TINY.output_vocab
+    seen.clear()
+    with torch.no_grad():
+        _loss(mir, _ids(vocab, 0), torch.from_numpy(_ids(vocab, 1).reshape(-1)))
+    values = np.concatenate(seen)
+    assert values.size and (values == 0).any() and (values != 0).any(), (
+        f"the live gate is trivial (values {np.unique(values)[:4]}); if it never "
+        f"skips a channel there is no surrogate term to explain the live gap"
+    )
+
+    frozen = _continuity(name, freeze=True, count=PROBES)
+    live = _continuity(name, freeze=False, count=PROBES)
+    assert sum(frozen.values()) == 0, (
+        "frozen the gate and a probe still moved the state, so the frozen model "
+        "is not the smooth conditional path the finite differences assume"
+    )
+    assert sum(live.values()) == 0, (
+        "the live mask now flips under this perturbation, so the live gap is a "
+        "genuine discontinuity and the surrogate-term explanation in this test's "
+        "docstring is stale -- re-measure before trusting either claim"
+    )
+    live_ok = _verdicts(_probes(name, freeze=False, count=PROBES))
+    frozen_ok = _verdicts(_probes(name, freeze=True, count=PROBES))
+    assert frozen_ok.get("ok", 0) > live_ok.get("ok", 0), (
+        f"freezing the mask did not improve agreement ({frozen_ok} frozen vs "
+        f"{live_ok} live), so the gap is not the surrogate term"
+    )
+
+
 # -- the harness must be able to fail ------------------------------------------
+
+
+def test_a_corrupted_supplied_gradient_is_caught_at_the_same_point():
+    """Positive control on the check itself, independent of model numerics.
+
+    Everything else here compares the model's own gradient to finite
+    differences. This one holds the parameters *fixed* and corrupts only the
+    gradient array handed to :func:`check_tensor` -- which is the shape of the
+    bugs a gradient harness is uniquely able to have: a transposed operand, a
+    dropped sign, a stride taken from the wrong axis, a scale factor applied
+    twice. The parameters never move, so the numeric derivative is identical in
+    every case and any change in verdict is the check working.
+    """
+    from bhanox.train.gradcheck import _sample_indices
+
+    vocab = TINY.output_vocab
+    ids, target = _ids(vocab, 0), torch.from_numpy(_ids(vocab, 1).reshape(-1))
+    mir = _build(freeze=True)
+    saved = _capture(mir)
+    params = dict(mir.named_parameters())
+    _restore(mir, saved)
+    _loss(mir, ids, target).backward()
+    name = "banks.1.W_o"
+    good = params[name].grad.detach().cpu().numpy().copy()
+    arr = params[name].detach().cpu().numpy().copy()
+
+    def loss(a: np.ndarray = arr) -> float:
+        _restore(mir, saved)
+        with torch.no_grad():
+            params[name].copy_(torch.from_numpy(a))
+        with torch.no_grad():
+            return float(_loss(mir, ids, target))
+
+    clean = check_tensor(name, arr, good, loss, count=PROBES, step=DEFAULT_STEP)
+    assert (
+        _verdicts(clean).get("mismatch", 0) == 0
+    ), "the control's premise is broken: the honest gradient must not disagree"
+
+    # Same parameters, same numeric derivative, four different ways to be wrong.
+    corruptions = {
+        "sign flipped": -good,
+        "scaled 1.5x": good * 1.5,
+        "zeroed": np.zeros_like(good),
+        "shifted by one element": np.roll(good, 1, axis=0),
+    }
+    indices = _sample_indices(arr.size, PROBES, 0)
+    for label, bad in corruptions.items():
+        results = check_tensor(name, arr, bad, loss, count=PROBES, step=DEFAULT_STEP)
+        caught = {r.index for r in results if r.verdict == "mismatch"}
+        assert caught, (
+            f"a supplied gradient with the {label} was not caught, so agreement "
+            f"elsewhere in this file is not evidence of anything"
+        )
+        # And it must be caught on the probes that carry signal, not merely on
+        # an entry that happens to be tiny.
+        assert any(
+            abs(float(good.reshape(-1)[i])) > r.floor
+            for r in results
+            if r.index in caught
+            for i in [int(r.index)]
+        ), f"the {label} was only caught on a below-noise probe for {name}"
+    # Sanity: the probes are the same points, so the comparison is like-for-like.
+    assert [r.index for r in clean] == [int(i) for i in indices]
 
 
 def test_a_broken_gradient_would_be_caught_by_this_harness():
     """Positive control. A checker that cannot fail is not evidence of anything.
 
-    Scales the read-out by 1.5 -- a real error of a size a plausible bug would
+    Scales the read-out by 3.0 -- a real error of a size a plausible bug would
     produce -- and requires the check to notice. A 1% error is *not* used,
     because it falls below the noise floor: the method genuinely cannot resolve
     it, and demanding that it catch one would be demanding a lie.
+
+    The multiplier was 1.5 in an earlier version of this test, and it passed for
+    the wrong reason. Measured at the corrected scales, 1.5x moves the loss by
+    2.1e-2 but the gradient by only ~13%, which is an absolute error of 4.1e-4
+    against a noise floor of 4.8e-4 -- so the checker correctly reports "ok" and
+    the control asserted nothing. The floor is absolute, not relative, so the
+    smallest detectable weight corruption is a property of the loss scale. The
+    sweep below pins both ends of that threshold so it cannot drift back.
     """
-    results = _probes("banks.1.W_o", count=4)
+    name = "banks.1.W_o"
+    results = _probes(name, count=4)
     assert (
         _verdicts(results).get("mismatch", 0) == 0
     ), "the control's premise is broken: the unbroken model must not disagree"
 
-    mir = _build(freeze=True)
-    with torch.no_grad():
-        mir.banks[1].W_o.mul_(1.5)
-    saved = _capture(mir)
-    params = dict(mir.named_parameters())
-    vocab = TINY.output_vocab
-    ids, target = _ids(vocab, 0), torch.from_numpy(_ids(vocab, 1).reshape(-1))
-
-    # The analytic gradient of the *unbroken* model, against the loss of the
-    # broken one. That is the shape of a real gradient bug.
     probe = _build(freeze=True)
     probe_saved = _capture(probe)
     probe_params = dict(probe.named_parameters())
     _restore(probe, probe_saved)
+    vocab = TINY.output_vocab
+    ids, target = _ids(vocab, 0), torch.from_numpy(_ids(vocab, 1).reshape(-1))
     _loss(probe, ids, target).backward()
-    good_grad = probe_params["banks.1.W_o"].grad.detach().cpu().numpy().copy()
+    good_grad = probe_params[name].grad.detach().cpu().numpy().copy()
 
-    arr = params["banks.1.W_o"].detach().cpu().numpy().copy()
-
-    def loss(a: np.ndarray = arr) -> float:
-        _restore(mir, saved)
+    def caught(mult: float) -> int:
+        mir = _build(freeze=True)
         with torch.no_grad():
-            params["banks.1.W_o"].copy_(torch.from_numpy(a))
-        with torch.no_grad():
-            return float(_loss(mir, ids, target))
+            mir.banks[1].W_o.mul_(mult)
+        saved = _capture(mir)
+        params = dict(mir.named_parameters())
+        arr = params[name].detach().cpu().numpy().copy()
 
-    results = check_tensor(
-        "banks.1.W_o", arr, good_grad, loss, count=4, step=DEFAULT_STEP
+        def loss(a: np.ndarray = arr) -> float:
+            _restore(mir, saved)
+            with torch.no_grad():
+                params[name].copy_(torch.from_numpy(a))
+            with torch.no_grad():
+                return float(_loss(mir, ids, target))
+
+        out = check_tensor(name, arr, good_grad, loss, count=4, step=DEFAULT_STEP)
+        return sum(r.verdict == "mismatch" for r in out)
+
+    assert caught(3.0) == 4, (
+        "tripling the read-out was not caught on every probe, so the passing "
+        "gradient checks above are not evidence of anything"
     )
-    assert any(r.verdict == "mismatch" for r in results), (
-        "a 50% error in the read-out was not detected, so the passing gradient "
-        "checks above are not evidence of anything"
+    # And the near-miss, pinned: 1.5x sits under the floor at these scales. If a
+    # future change to the loss scale makes this detectable, that is an
+    # improvement, and the recorded expectation should be updated -- not left
+    # to make the headline number look worse.
+    assert caught(1.5) < 4, (
+        "a 1.5x read-out error is now fully detected, which means this file has "
+        "more resolution than its docstring claims; re-measure and update"
     )
 
 

@@ -400,14 +400,27 @@ def test_scalar_id_is_rejected():
 
 
 def test_nbytes_and_param_count_match_the_reference():
-    """Both inventories agree, which is what the byte claim rests on."""
+    """Both inventories agree, which is what the byte claim rests on.
+
+    ``nbytes`` is a property on the reference and a method on the mirror; see
+    the note in the mirror. Both count the int8 codes plus the stored
+    per-column scales as float32, and both ``param_count``s count the codes,
+    the scales and the mix weights. The two inventories are different
+    quantities -- bytes versus values -- so they are checked against explicit
+    expected numbers rather than against a single identity between them; an
+    identity like ``param_count == nbytes + n_hashes`` only ever held while
+    every scale was free, which is exactly the state that let the scales go
+    missing in the first place.
+    """
     for d_model, pool, table in ((16, 64, 16), (128, 8192, 1024), (256, 8192, 1024)):
         gate, mirror = _pair(d_model=d_model, pool=pool, table=table)
-        # ``nbytes`` is a property on the reference and a method on the mirror;
-        # see the note in the mirror. Both are the int8 row count.
-        assert mirror.nbytes() == gate.nbytes == (pool + table) * d_model
+        codes = (pool + table) * d_model
+        scales_values = 2 * d_model  # pool_scale + table_scale
+        scales_bytes = scales_values * 4  # float32
+        assert gate.nbytes == codes + scales_bytes
+        assert mirror.nbytes() == gate.nbytes
+        assert gate.param_count() == codes + scales_values + mirror.n_hashes
         assert mirror.param_count() == gate.param_count()
-        assert mirror.param_count() == mirror.nbytes() + mirror.n_hashes
 
 
 def test_front_end_is_by_far_the_largest_single_component():
@@ -499,3 +512,55 @@ def test_embed_alias_is_the_same_path():
         mirror.embed(torch.tensor(ids)).detach().numpy(),
         mirror(torch.tensor(ids)).detach().numpy(),
     )
+
+
+def test_the_mirror_agrees_with_a_quantized_reference():
+    """The scales have to be applied in the mirror too, not just stored.
+
+    This is the failure mode the codes+scales split invites: the reference
+    multiplies its gathered rows by ``pool_scale``/``table_scale`` and the
+    mirror does not, and every embedding disagrees by exactly the per-column
+    scale (~1.3e-3 at nano), which reads as small numerical drift rather than
+    as a missing multiply. It is checked on a *quantized* gate because on an
+    unquantized one the scales are 1.0 and the test would pass either way.
+    """
+    gate = _front_end()
+    gate.quantize()
+    mirror = HashBindMirror(gate)
+    ids = _ids(np.random.default_rng(5), (4, 6))
+    ref = gate.embed(ids)
+    got = mirror(torch.tensor(ids)).detach().numpy()
+    assert np.max(np.abs(ref - got)) < TOL
+    # And the scales are not 1.0 here, so the agreement above is meaningful
+    # rather than a pair of unquantized paths trivially matching.
+    assert float(gate.pool_scale.max()) < 1.0
+    assert float(gate.table_scale.max()) < 1.0
+
+
+def test_load_from_numpy_carries_the_scales():
+    """A checkpoint load that brought codes across without their scales would
+    leave the mirror reading a 283x-795x wrong embedding with nothing in the
+    return value to indicate it, so the scales are copied and checked.
+
+    The mirror is built from the same gate object, as it is in use: the hash
+    is delegated to ``self.gate``, so a mirror handed a *different* gate would
+    be looking up rows with the wrong hash. To show the copy is doing work,
+    the destination is zeroed first.
+    """
+    gate = _front_end()
+    gate.quantize()
+    fresh = HashBindMirror(gate)
+    with torch.no_grad():
+        fresh.pool.zero_()
+        fresh.table.zero_()
+        fresh.pool_scale.zero_()
+        fresh.table_scale.zero_()
+    assert not np.allclose(fresh.pool.detach().numpy(), gate.pool)
+
+    fresh.load_from_numpy(gate)
+    with torch.no_grad():
+        assert np.allclose(fresh.pool_scale.detach().numpy(), gate.pool_scale)
+        assert np.allclose(fresh.table_scale.detach().numpy(), gate.table_scale)
+        assert np.allclose(fresh.pool.detach().numpy(), gate.pool)
+    ids = _ids(np.random.default_rng(6), (3, 4))
+    assert np.max(np.abs(gate.embed(ids) - fresh(ids).detach().numpy())) < TOL

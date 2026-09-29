@@ -392,6 +392,21 @@ class BhanoxMirror(nn.Module):
         arr = np.asarray(ids)
         if arr.ndim == 1:
             arr = arr[None, :]
+        if arr.ndim != 2:
+            raise ValueError(f"step expects (B, T) ids, got shape {arr.shape}")
+        # Checked before ``ensure_batch``, which is the whole point. Every other
+        # guard here is a shape check, but this one also has to run before the
+        # first state-mutating call: ``ensure_batch`` *grows* the recurrent
+        # state, so a rejected forward would leave the mirror holding rows for a
+        # window it refused to process. A rejection that mutates is not a
+        # rejection. Wording mirrors ``Bhanox.forward`` so the two paths report
+        # the same limit the same way.
+        if arr.shape[-1] > self.config.max_context:
+            raise ValueError(
+                f"context {arr.shape[-1]} exceeds max_context="
+                f"{self.config.max_context}. The state is O(1) in length, so "
+                "this is a training-window limit, not a runtime one."
+            )
         self.ensure_batch(int(arr.shape[0]))
         x = self.embed(arr)
         next_shadows: list[list[Tensor]] = []

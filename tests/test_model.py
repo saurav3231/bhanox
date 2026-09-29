@@ -197,7 +197,11 @@ class TestCost:
     def test_parameter_count_is_pinned(self) -> None:
         """A frozen architecture should not drift by accident. This is a
         regression guard, not a target: if a change moves it, say why."""
-        assert Bhanox(load_config("nano")).param_count() == 2_108_996
+        # 2_108_996 -> 2_109_252: HashBind now stores integral codes plus
+        # explicit scales, and those scales are real parameters the checkpoint
+        # carries. pool_scale (128,) + table_scale (128,) at d_model=128 is
+        # +256, and the count is unchanged without them.
+        assert Bhanox(load_config("nano")).param_count() == 2_109_252
 
     def test_packed_size_is_one_byte_per_parameter(self, model: Bhanox) -> None:
         assert model.packed_nbytes() == model.param_count()

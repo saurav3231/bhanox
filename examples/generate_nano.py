@@ -23,7 +23,7 @@ import bhanox
 
 
 def main() -> int:
-    """Encode a prompt, generate from it, and report the cost. Returns an exit code."""
+    """Continue a byte prompt, and report the cost. Returns an exit code."""
     cfg = bhanox.load_config("nano")
     model = bhanox.Bhanox(cfg)
 
@@ -34,16 +34,16 @@ def main() -> int:
     print(f"presets       {', '.join(bhanox.available_presets())}")
     print()
 
-    text = "the model remembers what it can fit"
-    ids = bhanox.frontend.encode(text)
-    print(f"prompt        {text!r}")
+    prompt = b"the model remembers what it can fit"
+    ids = bhanox.frontend.encode(prompt)
+    print(f"prompt        {prompt!r}")
     print(f"encoded       {len(ids)} ids (4-gram byte windows)")
     print()
 
-    out = bhanox.generate(model, ids, max_new=16, temperature=0.8, seed=0)
-    new = out[len(ids) :]
-    print(f"generated     {len(new)} tokens, {len(np.unique(new))} distinct")
-    print(f"token ids     {new.tolist()}")
+    out = bhanox.generate(model, prompt, max_new=16, temperature=0.8, seed=0)
+    new = np.frombuffer(out[len(prompt) :], dtype=np.uint8)
+    print(f"generated     {len(new)} bytes, {len(np.unique(new))} distinct")
+    print(f"byte values   {new.tolist()}")
     print()
 
     print("Cost, all figures measured at call time:")
@@ -52,10 +52,10 @@ def main() -> int:
     print()
 
     before = model.state_nbytes()
-    bhanox.generate(model, ids, max_new=256, temperature=0.8, seed=1)
+    bhanox.generate(model, prompt, max_new=256, temperature=0.8, seed=1)
     after = model.state_nbytes()
     print(
-        f"state after 256 more tokens: {after:,} B (was {before:,} B) "
+        f"state after 256 more bytes: {after:,} B (was {before:,} B) "
         "-- constant in context"
     )
     return 0

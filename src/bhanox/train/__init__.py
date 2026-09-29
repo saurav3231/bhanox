@@ -5,7 +5,7 @@ importing it is what pulls torch in. Nothing under ``src/bhanox`` outside this
 directory may import torch, which is enforced by a test rather than by
 convention.
 
-Six pieces, in the order they have to exist:
+Seven pieces, in the order they have to exist:
 
 - :mod:`bhanox.train.gradcheck` -- finite-difference gradient checks. This is
   the thing that has to be right before any weight is trained, because a wrong
@@ -37,7 +37,24 @@ Six pieces, in the order they have to exist:
   float implementations therefore agree exactly for a while and then diverge, and
   that is a property of the frozen architecture rather than of any mirror.
 
-Not written yet: the training loop itself.
+The prototype trainer, added on top of those seven. It trains the mirror on
+synthetic in-memory bytes and nothing else: no corpus, no checkpoint, no resume.
+
+- :mod:`bhanox.train.objective` -- position-wise next-byte cross-entropy and
+  the optimizer's parameter list, which excludes the gate's inert ``salience``.
+- :mod:`bhanox.train.reset` -- the document-boundary reset: zero the integer
+  state, flush the gates, keep everything that belongs to the run. Plus the
+  shadow-detach that makes a per-chunk schedule possible.
+- :mod:`bhanox.train.trainer` -- one optimizer step per chunk, and a document
+  loop. Truncated backpropagation at each chunk seam, documented as such.
+- :mod:`bhanox.train.smoke` -- the synthetic run. A repeating byte cycle, chosen
+  because random bytes have no learnable structure and a falling loss on them
+  would mean nothing. Reports its curve; asserts no threshold.
+
+What this milestone deliberately does not have: real training, a corpus, a
+learning-rate schedule, checkpointing, or resume. The mirror already provides
+``state_dict()`` through ``nn.Module``, so a checkpoint milestone needs no new
+mechanism -- only a decision about what may be claimed when resuming.
 
 
 The mirror is not optional bookkeeping. If it drifts from the numpy reference

@@ -126,12 +126,59 @@ class TestI3NoFloatInInference:
         assert not any(op.startswith("F") for op in WHITELIST)
 
     def test_no_float_dtype_reaches_the_deployed_arrays(self) -> None:
-        """The reference stores dequantized floats; the int8 regime is applied by
-        an explicit quantize() call, so nothing is silently float64."""
+        """The stored arrays are int8 codes; the scale is stored beside them.
+
+        After :meth:`HashBind.quantize` the pool and table hold integral int8
+        codes and ``pool_scale``/``table_scale`` hold the per-column absmax
+        factor, and :meth:`HashBind.embed` applies it. The int8 regime is a
+        property of that (codes, scale) pair, not of a float array that
+        happens to sit on the int8 grid.
+
+        The claims checked here, all of which the previous representation
+        failed: the codes are exactly integral, the scale is carried
+        explicitly and non-trivially, dequantizing the codes against the
+        stored scale reconstructs the real weights to within one int8 step
+        per column, and the embedding magnitude is unchanged. Storing
+        dequantized floats in ``pool`` satisfied a "fidelity to one step"
+        assertion while not being a quantization at all, and keeping the raw
+        codes satisfied an "every value is integral" assertion while being
+        283x-795x too large for ``embed`` to consume. See
+        ``tests/test_production_scales.py``.
+        """
         model = Bhanox(load_config("nano"))
+        ids = np.arange(8, dtype=np.int64)
+        rms_before = float(model.embedder.embed(ids).std())
+        before = model.embedder.pool.copy()
         model.embedder.quantize()
-        assert model.embedder.pool.dtype == np.float32
-        assert np.all(model.embedder.pool == np.rint(model.embedder.pool))
+        embedder = model.embedder
+
+        # 1. The stored codes are exactly integral -- the array an int8 kernel
+        #    consumes, not a float approximation of one.
+        assert embedder.pool.dtype == np.float32
+        assert np.array_equal(embedder.pool, np.rint(embedder.pool))
+        assert np.array_equal(embedder.table, np.rint(embedder.table))
+        assert np.all(np.abs(embedder.pool) <= 127)
+        assert np.all(np.abs(embedder.table) <= 127)
+
+        # 2. The scale is carried explicitly, and it is not a no-op factor.
+        assert embedder.pool_scale.shape == (embedder.d_model,)
+        assert embedder.table_scale.shape == (embedder.d_model,)
+        assert embedder.pool_scale.dtype == np.float32
+        assert np.all(embedder.pool_scale > 0)
+        assert embedder.pool_scale.max() / embedder.pool_scale.min() > 1.0
+
+        # 3. Dequantizing the codes against the stored scale reconstructs the
+        #    real weights to within one int8 step per column. This is the
+        #    fidelity claim, now on the dequantized view rather than on the
+        #    stored codes.
+        step = np.max(np.abs(before), axis=0, keepdims=True) / 127.0
+        reconstructed = embedder.dequantized_pool()
+        assert np.all(np.abs(reconstructed - before) <= step + 1e-12)
+
+        # 4. And the scale survived in the sense that matters: quantization
+        #    changed the codes, not the magnitude of the embedding produced.
+        rms_after = float(model.embedder.embed(ids).std())
+        assert rms_after == pytest.approx(rms_before, rel=0.02)
 
     def test_every_audit_reports_a_verified_whitelist(self) -> None:
         for name in PRESETS:

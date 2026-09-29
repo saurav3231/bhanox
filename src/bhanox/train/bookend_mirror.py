@@ -162,6 +162,8 @@ class HashBindMirror(nn.Module):
 
     pool: nn.Parameter
     table: nn.Parameter
+    pool_scale: nn.Parameter
+    table_scale: nn.Parameter
     g: nn.Parameter
 
     def __init__(self, gate: HashBind) -> None:
@@ -177,6 +179,14 @@ class HashBindMirror(nn.Module):
 
         self.pool = _p(gate.pool)
         self.table = _p(gate.table)
+        # The scales are parameters, not buffers, for the same reason the
+        # weights are: a quantizer's scale is fitted to those weights, so the
+        # optimizer has to be able to move it. They are separate tensors here for
+        # the same reason they are separate in the reference -- the codes must
+        # stay integral, so the factor that undoes the quantization cannot live
+        # folded into them.
+        self.pool_scale = _p(gate.pool_scale)
+        self.table_scale = _p(gate.table_scale)
         self.g = _p(gate.g)
 
     def hash_rows(self, ids: np.ndarray | Tensor) -> np.ndarray:
@@ -199,11 +209,21 @@ class HashBindMirror(nn.Module):
         Returns:
             ``float32`` embeddings of shape ``ids.shape + (d_model,)``.
         """
-        arr = torch.as_tensor(ids).to(torch.int64)
+        # ``ids`` arrives as numpy from ``BhanoxMirror.step``, so ``as_tensor``
+        # would land on the default device. It is moved to the table's device
+        # here, which is what makes the derived masks (``known``, the clamped
+        # index) land there too -- they are computed from ``arr``, so leaving
+        # ``arr`` on the CPU strands them on the CPU and the final ``torch.where``
+        # raises a device mismatch. ``pool`` is the anchor because the weights are
+        # what ``.to(device)`` moves; an ids tensor cannot pick a device itself.
+        arr = torch.as_tensor(ids).to(device=self.pool.device, dtype=torch.int64)
         if arr.ndim == 0:
             raise ValueError("ids must have at least one axis (the token axis)")
 
-        rows = torch.from_numpy(self.hash_rows(arr))
+        # ``hash_rows`` is the reference's integer index arithmetic, delegated
+        # unchanged, so it returns numpy on the host. The index has to follow the
+        # table: indexing a CUDA tensor with a CPU index tensor raises.
+        rows = torch.as_tensor(self.hash_rows(arr), device=self.pool.device)
         if rows.shape[-1] != self.n_hashes:
             raise ValueError(
                 f"expected {self.n_hashes} hash columns, got {rows.shape[-1]}"
@@ -223,9 +243,26 @@ class HashBindMirror(nn.Module):
         # injects is one ULP into every downstream layer. A four-iteration Python
         # loop is not a performance concern at ``n_hashes=4``; if that ever stops
         # being true the answer is still to keep the loop.
-        hashed = torch.zeros(*gathered.shape[:-2], self.d_model, dtype=gathered.dtype)
+        # ``device=gathered.device`` on both ``torch.zeros`` calls, not decoration.
+        # Without it a moved mirror silently built these on the *default* device
+        # while ``gathered`` sat on the GPU, and the very first add raised
+        # "Tensor on device cuda:0 is not on the expected device cpu". Deriving
+        # the device from a neighbouring tensor is what keeps the two together
+        # when the whole module has been ``.to()``-ed.
+        hashed = torch.zeros(
+            *gathered.shape[:-2],
+            self.d_model,
+            dtype=gathered.dtype,
+            device=gathered.device,
+        )
         for h in range(self.n_hashes):
             hashed = hashed + gathered[..., h, :] * self.g[h]
+        # Scale applied on the gathered rows, not folded into ``g``: the reference
+        # multiplies the summed result by ``pool_scale``, and folding the scale
+        # into ``g`` would put a ``d_model``-wide factor into a ``(n_hashes,)``
+        # vector. Same result, but the factor would be invisible in ``g`` and
+        # would not survive a checkpoint round-trip as a separate tensor.
+        hashed = hashed * self.pool_scale
 
         known = (arr >= 0) & (arr < self.vocab_table)
         # The index is clamped *and* the result is re-masked. Clamping alone is
@@ -235,7 +272,9 @@ class HashBindMirror(nn.Module):
         # defences for the same reason.
         direct = self.table[torch.where(known, arr, torch.zeros_like(arr))]
         return hashed + torch.where(
-            known[..., None], direct, torch.zeros((), dtype=hashed.dtype)
+            known[..., None],
+            direct * self.table_scale,
+            torch.zeros((), dtype=hashed.dtype, device=hashed.device),
         )
 
     def embed(self, ids: Tensor) -> Tensor:
@@ -250,18 +289,42 @@ class HashBindMirror(nn.Module):
         would go through ``nn.Module.__getattr__`` machinery and a property on
         the class is not a buffer or a parameter. Renaming the shape is the
         smaller surprise than a mirror that raises on attribute access.
+
+        Counts the scales for the same reason the reference does: the number has
+        to mean "everything this module holds" or it stops being the residency
+        figure the audit reports.
         """
-        return (self.pool.numel() + self.table.numel()) * 1
+        return (self.pool.numel() + self.table.numel()) * 1 + int(
+            self.pool_scale.numel() * 4 + self.table_scale.numel() * 4
+        )
 
     def param_count(self) -> int:
         """Total stored values, mirroring ``HashBind.param_count``."""
-        return int(self.pool.numel() + self.table.numel() + self.g.numel())
+        return int(
+            self.pool.numel()
+            + self.table.numel()
+            + self.pool_scale.numel()
+            + self.table_scale.numel()
+            + self.g.numel()
+        )
 
     def load_from_numpy(self, gate: HashBind) -> None:
-        """Copy reference arrays in, e.g. after a checkpoint load."""
+        """Copy reference arrays in, e.g. after a checkpoint load.
+
+        The scales are copied too, and the order matters: they are a fitted
+        property of the codes, so a load that brought codes across without their
+        scales would leave the module reading a 283x-795x wrong embedding with
+        nothing in the return value to indicate it.
+        """
         with torch.no_grad():
             self.pool.copy_(torch.tensor(np.array(gate.pool), dtype=torch.float32))
             self.table.copy_(torch.tensor(np.array(gate.table), dtype=torch.float32))
+            self.pool_scale.copy_(
+                torch.tensor(np.array(gate.pool_scale), dtype=torch.float32)
+            )
+            self.table_scale.copy_(
+                torch.tensor(np.array(gate.table_scale), dtype=torch.float32)
+            )
             self.g.copy_(torch.tensor(np.array(gate.g), dtype=torch.float32))
 
     def extra_repr(self) -> str:

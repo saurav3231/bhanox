@@ -73,11 +73,22 @@ caught by constructing a `Node` with `width_bits > 8`.
 Enforced by `bhanox.ir.verifier`, and checked on **every** audit run — so a graph
 that is not whitelist-clean fails before it is measured.
 
-A note on what this does and does not mean: the reference stores dequantized
-float32 weights and applies the int8 regime through an explicit `quantize()`
-call. I3 is a property of the op sequence, not of the reference's storage dtype.
-See `docs/architecture.md` for why running the reference on raw int8 codes
-breaks the router.
+A note on what this does and does not mean. I3 is a property of the op
+sequence, not of a single storage dtype, and the reference models differ in how
+they carry it:
+
+- `DeltaBank` and `MicroExpertLayer` store **dequantized** float32 weights. Codes
+  are ±127, and a float matmul against a 127x-scaled matrix saturates whatever
+  consumes it — the router, or the value path's `quantize_activation`. See
+  `docs/architecture.md`.
+- `HashBind` stores **int8 codes** in `pool`/`table` plus the per-column absmax
+  scale in `pool_scale`/`table_scale`, and `embed` applies the scale. The stored
+  array is integral, so it is what an int8 kernel consumes, and the arithmetic
+  still happens in real units. Both halves are named because dropping either
+  one is a silent 283x-795x error: the codes alone are far too large, and
+  dequantized values in a field documented as codes is not a quantization at
+  all. The scales are checkpointed state — see `TestQuantizerScalesSurvive` in
+  `tests/test_checkpoint.py`.
 
 ---
 

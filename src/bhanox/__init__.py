@@ -11,8 +11,7 @@ Quickstart::
     import bhanox
 
     model = bhanox.Bhanox(bhanox.load_config("nano"))
-    ids = bhanox.frontend.encode("hello")
-    out = model.generate(ids, max_new=32, temperature=0.8)
+    out = model.generate(b"hello", max_new=32, temperature=0.8)
     print(bhanox.report(model))
 
 Honesty note (project law A3): every number this package reports is either
@@ -35,7 +34,7 @@ from bhanox.config import (
     register_preset,
 )
 from bhanox.frontend.hashbind import HashBind, encode_bytes
-from bhanox.generate import generate
+from bhanox.generate import generate, generate_ids
 from bhanox.model import Bhanox, MemoryReport, PermSection, TempSection
 
 __version__ = "0.1.0"
@@ -53,6 +52,7 @@ __all__ = [
     "from_pretrained",
     "frontend",
     "generate",
+    "generate_ids",
     "load_config",
     "memory_report",
     "register_preset",

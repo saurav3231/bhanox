@@ -34,6 +34,7 @@ MAX8 = int(INT8_MAX)
 __all__ = [
     "MAX8",
     "identity",
+    "int8_codes",
     "l2_normalize",
     "quantize_activation",
     "quantize_activation_smooth",
@@ -101,6 +102,42 @@ def ste_requantise(x: Tensor, divisor: int = MAX8) -> Tensor:
     return _ste(x, x / divisor)
 
 
+def int8_codes(x: Tensor) -> Tensor:
+    """The reference's int8 codes, as a float tensor -- no gradient.
+
+    This is the *whole* of :func:`bhanox.quant.numerics.quantize_activation`'s
+    arithmetic: cast to float64, multiply by ``INT8_MAX``, round to nearest even,
+    clip to ``[-127, 127]``. Both torch quantisers go through here so the integer
+    path and the training surrogate cannot drift apart from the reference, or from
+    each other.
+
+    The float64 cast is the load-bearing part. The reference multiplies in
+    float64 because it casts the input first; a torch tensor arrives as float32
+    and would otherwise multiply in float32, where the product rounds to the
+    nearest representable value *before* rounding to an integer. Those are
+    different operations and they disagree: a product that float32 rounds to
+    exactly ``n + 0.5`` while float64 leaves it just below crosses the integer
+    boundary and yields a code one apart. Measured at roughly 4 in 3e6 random
+    activations -- rare enough to look like noise, frequent enough to be a real
+    fidelity gap, and completely invisible to any test that only compares model
+    outputs.
+
+    It is also not the explanation for the larger mirror mismatches. Those come
+    from genuinely different float32 layer accumulations landing on opposite
+    sides of a quantisation boundary, which no amount of precision inside the
+    quantiser can reconcile; see ``test_model_mirror.py``.
+
+    No rounding-rule workaround is needed: ``torch.round`` and ``np.rint`` both
+    implement round-half-to-even, so ``torch.round`` is the correct tie-break
+    and is kept as-is.
+    """
+    return torch.clamp(
+        torch.round(x.to(torch.float64) * INT8_MAX),
+        -float(INT8_MAX),
+        float(INT8_MAX),
+    )
+
+
 def quantize_activation(x: Tensor) -> Tensor:
     """``quantize_activation`` with a straight-through gradient.
 
@@ -123,12 +160,15 @@ def quantize_activation(x: Tensor) -> Tensor:
     Writing it as a single outer STE pins the scale to identity explicitly
     instead of leaving it as the product of two conventions that happen to
     disagree.
+
+    The returned float must come back in the *input* dtype. ``int8_codes``
+    promotes to float64, and letting that promotion escape would silently turn
+    the whole training surrogate into float64 -- doubling the shadow state and
+    breaking any downstream float32 matmul. The codes are small integers, so the
+    cast back is exact and only the *selection* of the code changes, which is
+    the entire point of the float64 product.
     """
-    return _ste(
-        x,
-        torch.clamp(torch.round(x * INT8_MAX), -float(INT8_MAX), float(INT8_MAX))
-        / INT8_MAX,
-    )
+    return _ste(x, int8_codes(x).to(x.dtype) / INT8_MAX)
 
 
 def quantize_activation_smooth(x: Tensor) -> Tensor:

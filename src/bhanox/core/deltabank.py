@@ -8,6 +8,18 @@ doesn't add a page — it erases the wrong answer already on that page and write
 the right one. Each page forgets on its own schedule, and there are pages that
 forget fast (details) and pages that forget slowly (gist).
 
+Module layout (law C5, one concern per module). This module is the head: the
+recurrence and its projections. The two related concerns live next door:
+
+- :mod:`bhanox.core.deltabank_numerics` -- the int8 grid the rule runs on
+  (``l2_normalize``, ``recip_lut``, the shared ``_RECIP`` table, the logistic).
+  :mod:`bhanox.train.mirror` needs the same table and the same normalisation as
+  the reference head, or the two disagree about what an int8 code means.
+- :mod:`bhanox.core.deltabank_layer` -- the multi-head wiring for one layer.
+
+The numerics are re-exported here, so ``from bhanox.core.deltabank import
+l2_normalize`` keeps working exactly as before.
+
 Architecture (spec D3, frozen)::
 
     k_t, v_t, q_t   = projections of x_t
@@ -43,6 +55,12 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
+from bhanox.core.deltabank_numerics import (
+    _RECIP,
+    _sigmoid,
+    l2_normalize,
+    recip_lut,
+)
 from bhanox.quant.numerics import (
     INT8_MAX,
     absmax_quantize,
@@ -54,70 +72,6 @@ from bhanox.quant.numerics import (
 from bhanox.seeding import init_rng
 
 __all__ = ["DeltaBankHead", "l2_normalize", "recip_lut"]
-
-
-def _sigmoid(z: NDArray[np.floating]) -> NDArray[np.floating]:
-    """Logistic function, branch-free.
-
-    Args:
-        z: Real array.
-
-    Returns:
-        ``sigmoid(z)`` in ``(0, 1)``.
-
-    Why a lookup instead of ``exp``: inference runs in the int8 regime (I3), so
-    the deployed graph uses a 256-entry LUT. The native runtime is what makes
-    that exact; the reference needs to agree to 1e-3 (I4), and this is accurate
-    to ~1e-7, so the two agree comfortably.
-    """
-    return 0.5 * (1.0 + np.tanh(0.5 * z))
-
-
-def l2_normalize(
-    x: NDArray[np.floating], axis: int = -1, eps: float = 1e-6
-) -> NDArray[np.floating]:
-    """L2-normalise along an axis, leaving near-zero rows as zeros.
-
-    Args:
-        x: Input array.
-        axis: Axis to normalise over.
-        eps: Floor on the denominator, so an all-zero row returns zero rather
-            than NaN. A zero key/query must contribute nothing, not poison the
-            state.
-
-    Returns:
-        Array of the same shape with unit-norm rows (or zero rows).
-    """
-    norm = np.sqrt(np.sum(x * x, axis=axis, keepdims=True))
-    return x / np.maximum(norm, eps)
-
-
-def recip_lut(n_entries: int = 256, *, bits: int = 16) -> NDArray[np.float32]:
-    """Reciprocal lookup table for the delta-rule step size.
-
-    The delta rule requires ``beta = 1 / ||k||^2`` for the update to be a true
-    projection. A reciprocal is a divide, and division is not in the I3
-    whitelist; a 256-entry LUT is. With K L2-normalised, ``||k||^2 == 1`` and
-    the table is read at index 1, so the LUT is exact in the normal case and
-    only approximates the pathological one.
-
-    Args:
-        n_entries: Table size. Must be <= 256 to satisfy I3's LUT bound.
-        bits: Fixed-point fraction bits when encoding the index.
-
-    Returns:
-        ``float32`` table of ``1 / i`` for ``i`` in ``1..n_entries``.
-
-    Raises:
-        ValueError: If ``n_entries`` exceeds the 256-entry LUT limit.
-    """
-    if n_entries > 256:
-        raise ValueError(
-            f"recip_lut size {n_entries} exceeds the 256-entry LUT bound (I3)"
-        )
-    idx = np.arange(1, n_entries + 1, dtype=np.float64)
-    scale = float(1 << bits)
-    return (np.rint(scale / idx) / scale).astype(np.float32)
 
 
 @dataclass
@@ -181,9 +135,12 @@ class DeltaBankHead:
     def __post_init__(self) -> None:
         """Allocate projections and the state.
 
-        Why integer-valued projections at init: the int8 regime is the default
-        deployment state, so the reference starts inside it instead of
-        describing it from the outside. Scales are folded into the readout.
+        Why the projections are stored dequantized: the int8 regime is a
+        property of the deployed op sequence, not a licence to run the
+        reference on unscaled int8 codes. The per-column absmax scale is
+        applied here, once, so that ``X @ W_v`` lands on the unit grid that
+        :func:`quantize_activation` and the read-gate sigmoid both expect.
+        See the note in :meth:`proj` and ``docs/architecture.md``.
 
         The stream is keyed by ``head_index`` as well as the shape. Keying on
         shape alone gave every head of a layer the same stream, so the four
@@ -195,7 +152,33 @@ class DeltaBankHead:
 
         def proj(rows: int, cols: int) -> NDArray[np.floating]:
             w = rng.standard_normal((rows, cols)) / np.sqrt(rows)
-            return absmax_quantize(w, axis=0).q.astype(np.float32)
+            # Dequantized, not the raw int8 codes. docs/architecture.md records
+            # this exact failure for MicroExpert ("a float matmul against a
+            # 127x-scaled matrix gives router logits with a spread of ~500,
+            # which saturates the softmax") and it applies here unchanged: the
+            # codes are +/-127, so `X @ W_v` lands at a median |v| of ~430
+            # against a quantize_activation grid that assumes |x| <= 1.
+            #
+            # Measured at nano before this fix: 99.9% of value projections
+            # clipped, `v8` reduced to 2-6 distinct codes out of 255, and the
+            # read gate 99.3% saturated -- the gate the spec credits with
+            # +0.037 BPC was a hard on/off switch with no usable gradient. The
+            # L2 normalisation hid it for W_k and W_q only; W_v reaches the
+            # quantiser and W_r the sigmoid unscaled.
+            #
+            # The int8 regime is a property of the deployed op sequence, not a
+            # licence to run the reference on unscaled codes.
+            #
+            # Measured on the real residual stream at nano, this init is already
+            # well placed: median |X @ W_v| 0.677 (grid assumes |x| <= 1) with
+            # 250-254 distinct `v8` codes across heads. Rescaling W_v to fill
+            # the grid further was tried and reverted: it was sized against the
+            # synthetic items in tests/core/test_deltabank.py, which are ~11x
+            # smaller than real activations, and on the real stream it pushed
+            # the median to 3.835, cut `v8` to 159-169 distinct codes and
+            # clipped 86.4% of value codes. Do not re-tune this without
+            # measuring on _residual_stream, not on a test fixture.
+            return absmax_quantize(w, axis=0).dequantize().astype(np.float32)
 
         self.W_k = proj(d, self.d_k)
         self.W_q = proj(d, self.d_k)
@@ -493,6 +476,3 @@ class DeltaBankHead:
             if np.all(np.abs(self.recall(k) - v) <= tol):
                 hits += 1
         return hits / max(1, len(keys))
-
-
-_RECIP = recip_lut(256)

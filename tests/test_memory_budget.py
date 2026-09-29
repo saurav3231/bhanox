@@ -457,7 +457,7 @@ class TestGenerationMemoryIsFlat:
         model = Bhanox(cfg)
         before_temp = model.state_nbytes()
         before_perm = model.vault.nbytes
-        model.generate(np.arange(8, dtype=np.int64), max_new=32)
+        model.generate(b"a short byte prompt", max_new=32)
         assert model.state_nbytes() == before_temp
         assert model.vault.nbytes == before_perm
 
@@ -465,7 +465,7 @@ class TestGenerationMemoryIsFlat:
         """A longer prompt must not cost more state."""
         model = Bhanox(load_config("nano"))
         short = model.state_nbytes()
-        model.generate(np.arange(4, dtype=np.int64), max_new=16)
+        model.generate(b"tiny", max_new=16)
         model.reset()
-        model.generate(np.arange(512, dtype=np.int64), max_new=16)
+        model.generate(bytes(range(64)) * 16, max_new=16)
         assert model.state_nbytes() == short

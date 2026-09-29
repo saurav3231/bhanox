@@ -15,10 +15,13 @@ hold their initial values after a training run.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
-from bhanox.train.ste import ste_ge, ste_gt
+from bhanox.quant.numerics import quantize_activation
+from bhanox.train.ste import int8_codes, ste_ge, ste_gt
+from bhanox.train.ste import quantize_activation as ste_quantize_activation
 
 torch.manual_seed(0)
 
@@ -181,3 +184,108 @@ def test_composes_with_boolean_arithmetic():
     assert (woke * (1.0 - protected)).tolist() == [0.0, 0.0, 1.0]
     assert woke.max().item() == 1.0
     assert woke.min().item() == 0.0
+
+
+# -- quantisation fidelity: the reference's exact arithmetic ---------------
+
+
+def test_int8_codes_match_the_reference_on_exact_halves():
+    """Half-integers round to even on both sides -- and neither gets a fix.
+
+    ``np.rint`` and ``torch.round`` both implement round-half-to-even, so the
+    tie-break needs no reconciliation. This pins that shared rule at the exact
+    halves where the two would disagree if either drifted to half-away-from-zero,
+    which is a distinction that is easy to assert wrongly in prose.
+    """
+    halves = np.array(
+        [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 126.5, 127.5, -0.5, -1.5, -2.5, -3.5],
+        dtype=np.float64,
+    )
+    x = halves / 127.0
+    want = np.rint(halves)  # documented rule: ties to even
+    assert want.tolist() == [0, 2, 2, 4, 4, 6, 126, 128, 0, -2, -2, -4]
+
+    got = int8_codes(torch.tensor(x, dtype=torch.float64)).numpy().astype(np.int64)
+    # 127.5 ties to 128, then saturates back to 127 -- the clip is part of the
+    # contract, so the reference and the mirror must both apply it.
+    assert got.tolist() == [0, 2, 2, 4, 4, 6, 126, 127, 0, -2, -2, -4]
+    assert got.tolist() == quantize_activation(x).tolist()
+
+
+def test_int8_codes_match_the_reference_where_float32_product_would_not():
+    """The float64 product is the whole point; a float32 one is observably wrong.
+
+    Each value below is chosen so the float32 product rounds *up to* the half
+    while the float64 product stays just below it, which is the disagreement this
+    fixes. A float32 quantiser returns the upper code for all of these and the
+    reference returns the lower one, so this test fails loudly on a regression to
+    float32 arithmetic rather than drifting by a hair.
+    """
+    worst = 0.0
+    checked = 0
+    for n in range(127):
+        for value in (n + 0.5, n - 0.5):
+            # Round-trip through float32 so the input is exactly what the model
+            # hands the quantiser, then locate the nearest float32 that puts the
+            # product on the wrong side of the boundary.
+            x32 = np.float32(value / 127.0)
+            got = int(int8_codes(torch.tensor([x32])).item())
+            want = int(quantize_activation(np.array([x32]))[0])
+            assert got == want, (x32, got, want)
+            # Show the failure the float32 product would have produced.
+            f32 = float(np.float32(x32) * np.float32(127.0))
+            f64 = float(np.float64(x32) * 127.0)
+            worst = max(worst, abs(f32 - f64))
+            checked += 1
+    assert checked == 254
+    assert worst > 0.0
+
+
+def test_int8_codes_match_the_reference_on_a_large_random_sample():
+    """The boundary cases above are the mechanism; this is the rate.
+
+    A float32 product disagrees with the reference at roughly 4 activations in
+    3e6, so no small sample would notice. This is sized to catch a regression to
+    float32 arithmetic without being slow.
+    """
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(500_000) * 0.9).astype(np.float32)
+    got = int8_codes(torch.from_numpy(x)).numpy().astype(np.int32)
+    assert np.array_equal(got, quantize_activation(x))
+
+
+def test_ste_gradient_is_unchanged_by_the_float64_product():
+    """The fidelity fix must not disturb the backward pass.
+
+    ``quantize_activation`` is one outer STE, so the gradient is exactly 1 with
+    respect to its input everywhere -- interior, on a boundary, and saturated.
+    The float64 promotion lives entirely inside the detached branch, so it cannot
+    reach the graph. The dtype is pinned too: letting float64 escape would turn
+    the whole training surrogate into float64 and break downstream float32
+    matmuls without changing a single gradient.
+    """
+    for dtype in (torch.float32, torch.float64):
+        x = torch.tensor(
+            [0.1, -0.3, 0.55, 0.9, 2.0, -3.0], requires_grad=True, dtype=dtype
+        )
+        y = ste_quantize_activation(x)
+        assert y.dtype == dtype
+        y.sum().backward()
+        assert torch.equal(x.grad, torch.ones_like(x))
+
+
+def test_ste_forward_value_is_exactly_the_reference_code_over_127():
+    """The STE's value and the integer path's code are the same fact.
+
+    If these two ever disagreed, training would be optimising a quantiser the
+    deployed model does not run -- the same class of bug as the 127x error
+    ``ste_requantise(ste_round(...))`` would introduce, and just as invisible.
+    """
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(100_000) * 0.9).astype(np.float32)
+    for dtype in (torch.float32, torch.float64):
+        y = ste_quantize_activation(torch.tensor(x, dtype=dtype)).detach()
+        assert np.array_equal(
+            np.rint(y.numpy().astype(np.float64) * 127.0).astype(np.int32),
+            quantize_activation(x),
+        )

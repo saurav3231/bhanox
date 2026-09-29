@@ -164,6 +164,94 @@ class TestInventory:
             _segments("not a name[0]")
 
 
+class TestQuantizerScalesSurvive:
+    """A quantized front-end's scales are checkpointed state, not derived data.
+
+    ``HashBind`` stores int8 codes in ``pool``/``table`` and the per-column
+    absmax factor in ``pool_scale``/``table_scale``, and ``embed`` multiplies
+    them back together. The scales are therefore load-bearing: a checkpoint
+    that carried the codes across without them would restore a model whose
+    embeddings are 283x-795x too large, and every weight-comparison test in
+    this file would still pass, because the codes themselves came back
+    correctly.
+
+    That is the reason this class exists. ``scramble`` plus
+    ``worst_diff == 0`` cannot see a missing scale -- the arrays it checks are
+    intact either way -- so the scale is asserted directly, and then the
+    embedding is compared to prove the restored model is numerically the same
+    one rather than merely self-consistent.
+    """
+
+    def test_scales_are_in_the_inventory(self, tmp_path: Path) -> None:
+        model = nano()
+        model.embedder.quantize()
+        names = {name for name, _ in inventory(model)}
+        assert "embedder.pool_scale" in names
+        assert "embedder.table_scale" in names
+
+    def test_codes_stay_integral_through_a_round_trip(self, tmp_path: Path) -> None:
+        """A quantized model's stored arrays are still the int8 grid after load.
+
+        The stored arrays are what an int8 kernel consumes, so the
+        representation itself is part of the checkpoint's promise, not just
+        the values in it. A restore that promoted the codes to dequantized
+        floats would return "the right weights" by every value comparison
+        while quietly changing what the model is.
+        """
+        source = nano()
+        source.embedder.quantize()
+        assert np.array_equal(source.embedder.pool, np.rint(source.embedder.pool))
+
+        path = tmp_path / "codes.pt"
+        save(source, path)
+        target = nano()
+        load(path, target)
+
+        assert np.array_equal(target.embedder.pool, np.rint(target.embedder.pool))
+        assert np.array_equal(target.embedder.table, np.rint(target.embedder.table))
+        assert np.all(np.abs(target.embedder.pool) <= 127)
+        assert np.all(np.abs(target.embedder.table) <= 127)
+
+    def test_a_quantized_model_restores_to_identical_embeddings(
+        self, tmp_path: Path
+    ) -> None:
+        source = nano()
+        source.embedder.quantize()
+        before = source.embedder.embed(IDS).copy()
+        scales = source.embedder.pool_scale.copy()
+
+        path = tmp_path / "quantized.pt"
+        save(source, path)
+        target = nano()
+        load(path, target)
+
+        # The scale is what the codes need in order to mean anything.
+        assert np.array_equal(target.embedder.pool_scale, scales)
+        assert np.array_equal(target.embedder.table_scale, source.embedder.table_scale)
+        assert np.array_equal(target.embedder.pool, source.embedder.pool)
+        # And the restored front-end is the same function, not merely the same
+        # stored integers. This is the assertion that fails if the scale is
+        # dropped anywhere between save and load.
+        assert np.array_equal(target.embedder.embed(IDS), before)
+
+    def test_a_different_scale_would_be_detected(self, tmp_path: Path) -> None:
+        """Pin that the test above is discriminating.
+
+        Writing a wrong scale into the target and confirming the embedding
+        moves. Without this, "the embeddings match" could be passing because
+        the scale is 1.0 everywhere and the multiply is a no-op.
+        """
+        source = nano()
+        source.embedder.quantize()
+        before = source.embedder.embed(IDS).copy()
+        assert float(source.embedder.pool_scale.max()) < 1.0  # not a unit factor
+
+        broken = nano()
+        broken.embedder.quantize()
+        broken.embedder.pool_scale = np.ones_like(broken.embedder.pool_scale)
+        assert not np.allclose(broken.embedder.embed(IDS), before)
+
+
 class TestRoundTrip:
     def test_restores_every_weight_bit_exactly(self, saved: Path) -> None:
         source = nano()

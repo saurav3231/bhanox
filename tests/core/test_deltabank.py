@@ -354,9 +354,37 @@ def _capacity_heads(n_heads: int) -> list[DeltaBankHead]:
     ]
 
 
-def _stored_items(seed: int, n: int) -> np.ndarray:
-    xs = np.random.default_rng(seed).standard_normal((n, load_config("nano").d_model))
-    return unit_rows(xs.astype(np.float32))
+def _stored_items(seed: int, n: int) -> NDArray[np.float32]:
+    """``n`` deterministic probe items, at the scale the memory actually sees.
+
+    The rows are ``sqrt(d_model)``-norm, not unit-norm. Every DeltaBank layer
+    in the real forward pass is handed a layer-normed activation, and
+    ``layer_norm`` has no affine gain here, so each row it produces has L2 norm
+    exactly ``sqrt(d_model)`` (11.314 at nano, measured). Unit-norm rows are
+    ~11x smaller than anything the model feeds the memory, and the int8 value
+    path notices: ``quantize_activation`` is a fixed-scale quantiser
+    (``rint(x * 127)``, documented for ``|x| <= 1``), so at unit-norm the
+    projections are median ``|X @ W_v|`` 0.06 and ``v8`` spans only ~52 of 255
+    codes, against median 0.68 and ~128-254 codes at the real scale. Capacity
+    measured on the undersized rows is therefore measuring a regime the model
+    never runs in, and it understates what one head holds.
+
+    What that cost, before this scale was corrected: the 8-item case measured
+    0.625-0.750 across ``CAP_SEEDS`` rather than the 0.750-0.875 its own
+    docstring claims, and seed 7 fell below the 0.7 bar. At the real scale the
+    three seeds measure 0.750/0.875/0.875, which is what the docstring says.
+
+    Worth being explicit that this is a *fixture* correction, not a change to
+    the bar. ``> 0.7`` is unchanged, no expected value was edited, and the
+    overload end of the test is still the binding constraint: 48 items stays at
+    0.188-0.271 against a ``< 0.3`` bound, and 1 head at 32 items stays at
+    0.250-0.375 against ``< 0.5``. Scaling the probe items up did not make the
+    memory look good at everything; it made the easy case measurable and left
+    the hard case hard.
+    """
+    d_model = load_config("nano").d_model
+    xs = np.random.default_rng(seed).standard_normal((n, d_model))
+    return (unit_rows(xs.astype(np.float32)) * np.sqrt(d_model)).astype(np.float32)
 
 
 def retrieval_accuracy(heads: list[DeltaBankHead], xs: np.ndarray) -> float:
@@ -412,16 +440,19 @@ class TestHeadCapacity:
     buy capacity. Before the seeding fix the heads were byte-identical and this
     was not measurable: four copies of one memory are not four memories.
 
-    Measured across five item draws: 1 head holds 16-24 items at >=50%
-    retrieval accuracy (median 20, d_k = 16); 4 heads hold 48-64 (median 48).
-    The ratio spans 2.40x-4.00x, median 2.67x -- short of the ideal 4x because
-    the heads share one input space, so cross-head interference is not zero.
+    Measured across five item draws, on the ``sqrt(d_model)``-norm items from
+    :func:`_stored_items`: 1 head holds 16-24 items at >=50% retrieval accuracy
+    (median 24, d_k = 16); 4 heads hold 64 (0.572 at 64 items, 0.443 at 80, so
+    64 is the last count above 0.5). The ratio spans 2.67x-4.00x, median 2.67x
+    -- short of the ideal 4x because the heads share one input space, so
+    cross-head interference is not zero.
     """
 
     @pytest.mark.parametrize("seed", CAP_SEEDS)
     def test_four_heads_retain_more_than_one(self, seed: int) -> None:
         """At twice the single-head ceiling, one head has lost the plot and four
-        have not. Measured: 1 head <= 0.281, 4 heads >= 0.812 (gap +0.53)."""
+        have not. Measured over CAP_SEEDS: 1 head 0.250-0.375, 4 heads
+        0.844-0.906 (gap +0.469 to +0.656)."""
         xs = _stored_items(seed, CAP_ITEMS)
         one = retrieval_accuracy(_capacity_heads(1), xs)
         four = retrieval_accuracy(_capacity_heads(4), xs)

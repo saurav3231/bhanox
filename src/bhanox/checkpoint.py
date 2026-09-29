@@ -18,26 +18,81 @@ Why this shape:
 - **Bit-exact.** Weights round-trip as raw arrays with no cast and no
   requantisation. A checkpoint that reloads to slightly different numbers is
   worse than no checkpoint: it looks like it worked.
+- **Scalars are not silently dropped.** The inventory walk can only carry
+  arrays, so a dataclass holding live state in plain ints and floats would
+  restore as an empty husk with its tables still full. The VectorVault is the
+  live case: ``filled`` and ``clock`` decide whether the recovered entries can
+  be read at all, so they travel in a namespaced, versioned metadata block
+  (:data:`RUNTIME_KEY`), and a checkpoint carrying the arrays without that
+  block is refused rather than half-restored.
 
 Recurrent state is deliberately *not* saved. It is a fixed buffer rebuilt by
 ``reset()``, which is what keeps a checkpoint proportional to parameters rather
 than to context length. The trainer owns the decision to carry a sequence
 across a resume, and that is a training concern, not a model one.
+
+Module layout (law C5, one concern per module). This module is the *archive*:
+the file format, the atomic write, and ``save``/``load``. Its two supporting
+concerns live next door and are re-exported here, so every name below keeps
+importing from ``bhanox.checkpoint`` exactly as before:
+
+- :mod:`bhanox.checkpoint_inventory` -- which arrays persist, and the path
+  grammar that maps an inventory name onto a live object graph.
+- :mod:`bhanox.checkpoint_vault` -- the VectorVault scalar runtime state the
+  array walk structurally cannot carry.
+
+The dependency runs one way (this module imports from both; neither imports
+back), so neither concern has to know about the other's half of the job.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
-from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from numpy.typing import NDArray
 
+from bhanox.checkpoint_inventory import (
+    SKIP,
+    _assign,
+    _segments,
+    _walk,
+    inventory,
+)
+from bhanox.checkpoint_vault import (
+    RUNTIME_KEY,
+    RUNTIME_VERSION,
+    VAULT_STATE,
+    _apply_vault_state,
+    _check_vault_state,
+    _int_field,
+    _vault_state,
+)
 from bhanox.config import BhanoxConfig
+
+__all__ = [
+    "FORMAT",
+    "META_KEY",
+    "RUNTIME_KEY",
+    "RUNTIME_VERSION",
+    "SKIP",
+    "STEP_KEY",
+    "VAULT_STATE",
+    "VERSION",
+    "_apply_vault_state",
+    "_assign",
+    "_check_vault_state",
+    "_int_field",
+    "_segments",
+    "_vault_state",
+    "_walk",
+    "inventory",
+    "load",
+    "read_meta",
+    "save",
+]
 
 #: Written into every archive and checked on load.
 FORMAT = "bhanox-checkpoint"
@@ -49,136 +104,6 @@ VERSION = 1
 #: inventory name.
 META_KEY = "__meta__"
 STEP_KEY = "__step__"
-
-#: Field names never persisted, at any depth.
-#:
-#: These are all *runtime* state rather than parameters. The reason to keep the
-#: list short is that a checkpoint silently missing a weight is a different
-#: model; the reason to include these is that they are not weights.
-#:
-#: ``state``, ``cached``, ``awake``, ``_quiet``, ``_has_run`` are the recurrent
-#: buffers, rebuilt by ``reset()``/``flush()``. Saving them would also make a
-#: checkpoint's contents depend on the batch size of whichever run wrote it --
-#: these carry a sample axis, so a batch-4 save would not equal a batch-1 save
-#: of the same weights. Parameters-only keeps the file predictable, and a
-#: stateful mid-sequence resume is the trainer's to own.
-#:
-#: ``loads`` is a per-call MoE routing counter by design, and ``decay``/``decay_q``
-#: are derived from the bank rates.
-SKIP = frozenset(
-    {
-        "state",
-        "cached",
-        "awake",
-        "_quiet",
-        "_has_run",
-        "loads",
-        "decay_q",
-        "decay",
-    }
-)
-
-
-def _walk(obj: Any, prefix: str) -> list[tuple[str, NDArray[Any]]]:
-    """Every array reachable from ``obj``, as ``(name, array)`` pairs.
-
-    Walks dataclass fields in declaration order, so the inventory is stable
-    across runs and diffable between two checkpoints of the same model.
-    Recursion is depth-first and containers (list of layers) are indexed.
-    """
-    found: list[tuple[str, NDArray[Any]]] = []
-    if isinstance(obj, np.ndarray):
-        return [(prefix, obj)]
-    if is_dataclass(obj) and not isinstance(obj, type):
-        for f in fields(obj):
-            if f.name in SKIP:
-                continue
-            value = getattr(obj, f.name)
-            if isinstance(value, np.ndarray):
-                found.append((f"{prefix}.{f.name}", value))
-            elif is_dataclass(value) and not isinstance(value, type):
-                found.extend(_walk(value, f"{prefix}.{f.name}"))
-            elif isinstance(value, (list, tuple)):
-                for i, item in enumerate(value):
-                    if isinstance(item, np.ndarray):
-                        found.append((f"{prefix}.{f.name}[{i}]", item))
-                    elif is_dataclass(item) and not isinstance(item, type):
-                        found.extend(_walk(item, f"{prefix}.{f.name}[{i}]"))
-    return found
-
-
-def inventory(model: Any) -> list[tuple[str, NDArray[Any]]]:
-    """Name and array for every persisted tensor on ``model``.
-
-    The recurrent state and the volatile per-step counters are excluded via
-    :data:`SKIP`: the state is rebuilt by ``reset()`` and the counters are
-    derived. Everything else is a weight or a learned table, and a checkpoint
-    missing a weight is silently a different model.
-    """
-    found: list[tuple[str, NDArray[Any]]] = []
-    for f in fields(model):
-        if f.name in SKIP:
-            continue
-        value = getattr(model, f.name)
-        if isinstance(value, np.ndarray):
-            found.append((f.name, value))
-        elif is_dataclass(value) and not isinstance(value, type):
-            found.extend(_walk(value, f.name))
-        elif isinstance(value, (list, tuple)):
-            for i, item in enumerate(value):
-                if isinstance(item, np.ndarray):
-                    found.append((f"{f.name}[{i}]", item))
-                elif is_dataclass(item) and not isinstance(item, type):
-                    found.extend(_walk(item, f"{f.name}[{i}]"))
-    return found
-
-
-def _assign(model: Any, name: str, array: NDArray[Any]) -> None:
-    """Write ``array`` back into ``model`` at inventory ``name``.
-
-    Inverts :func:`inventory` by walking the same path grammar, so the two
-    cannot drift: ``deltabanks[0].heads[1].W_k`` steps through a field, an
-    index, a field, an index, and a leaf. A path that does not resolve is a
-    version error and is raised, never skipped -- a checkpoint that loads
-    "mostly" is the failure this guards against.
-    """
-    target: Any = model
-    for i, seg in enumerate(_segments(name)):
-        last = i == len(_segments(name)) - 1
-        if seg.startswith("["):
-            idx = int(seg[1:-1])
-            if not isinstance(target, (list, tuple)) or idx >= len(target):
-                raise ValueError(f"checkpoint path {name!r} does not fit this model")
-            target = target[idx]
-            continue
-        if not hasattr(target, seg):
-            raise ValueError(f"checkpoint has no field {seg!r} in path {name!r}")
-        target = getattr(target, seg)
-        if last:
-            if not isinstance(target, np.ndarray):
-                raise ValueError(f"checkpoint field {name!r} is not an array")
-            if target.shape != array.shape:
-                raise ValueError(
-                    f"checkpoint field {name!r} has shape {array.shape}, "
-                    f"model expects {target.shape}"
-                )
-            target[...] = array
-
-
-def _segments(name: str) -> list[str]:
-    """Split an inventory name into field and index steps.
-
-    ``"mixers[2].E"`` -> ``["mixers", "[2]", "E"]``.
-    """
-    out: list[str] = []
-    for part in name.split("."):
-        match = re.match(r"^([A-Za-z_]\w*)((?:\[\d+\])*)$", part)
-        if not match:
-            raise ValueError(f"unparseable checkpoint path segment: {part!r}")
-        out.append(match.group(1))
-        for idx in re.findall(r"\[\d+\]", match.group(2)):
-            out.append(idx)
-    return out
 
 
 def _atomic_write(path: Path, write: Any) -> None:
@@ -239,8 +164,13 @@ def save(
     }
     if config is not None:
         meta["config"] = config.to_dict()
+    # Recorded here rather than left to the caller: the walk cannot see these
+    # fields, and a caller who has to remember them is a caller who forgets.
+    vault = getattr(model, "vault", None)
+    if vault is not None:
+        meta[RUNTIME_KEY] = {"vectorvault": _vault_state(vault)}
     if extra:
-        clash = set(extra) & set(meta["tensors"])
+        clash = set(extra) & (set(meta["tensors"]) | {RUNTIME_KEY})
         if clash:
             raise ValueError(f"extra metadata shadows tensor names: {sorted(clash)}")
         meta["extra"] = extra
@@ -287,12 +217,16 @@ def load(path: str | Path, model: Any | None = None) -> Any:
             right architecture without the caller having to remember it.
 
     Returns:
-        The model, restored in place if one was passed, or newly built.
+        The model, restored in place if one was passed, or newly built. A
+        VectorVault's slot tables *and* its scalar state come back together, so
+        the returned vault is the one that was saved rather than an empty
+        husk holding recovered entries.
 
     Raises:
         OSError: The file is not a Bhanox checkpoint.
-        ValueError: The version is unknown, or a tensor does not fit the
-            target model's shapes.
+        ValueError: The version is unknown, a tensor does not fit the target
+            model's shapes, or the VectorVault state is absent, incomplete, or
+            disagrees with the slot tables beside it.
     """
     meta = read_meta(path)
 
@@ -305,12 +239,38 @@ def load(path: str | Path, model: Any | None = None) -> Any:
         model = _build_from_config(cfg)
 
     tensors = meta["tensors"]
+    # Checked before a single array is written, so a refused load leaves the
+    # target untouched rather than half-overwritten.
+    block = (meta.get(RUNTIME_KEY) or {}).get("vectorvault")
+    if block is None and any(n.startswith("vault.") for n in tensors):
+        raise ValueError(
+            f"{path} stores VectorVault arrays but no VectorVault scalar state: "
+            "it predates vault state being checkpointed, and restoring it would "
+            "rebuild a populated vault reporting filled=0 that answers no query. "
+            "Re-save it from a build that records vault state."
+        )
+    if block is not None and getattr(model, "vault", None) is None:
+        raise ValueError(
+            f"{path} holds VectorVault state but the target model has no vault"
+        )
     with np.load(Path(path), allow_pickle=False) as data:
         missing = [n for n in tensors if n not in data.files]
         if missing:
             raise ValueError(f"{path} is missing tensors: {missing[:4]}")
+        # Checked here, before the assign loop, so a bad block refuses the load
+        # outright instead of half-overwriting the target first.
+        state = None
+        if block is not None:
+            state = _check_vault_state(
+                model.vault,
+                block,
+                path,
+                data["vault.age"] if "vault.age" in data.files else None,
+            )
         for name in tensors:
             _assign(model, name, data[name])
+    if state is not None:
+        _apply_vault_state(model.vault, state)
     return model
 
 

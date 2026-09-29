@@ -21,13 +21,18 @@ pick.
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 import pytest
 import torch
 from torch import Tensor
 
+import bhanox.core.deltabank as db
+import bhanox.train.mirror as tm
 from bhanox.config import BhanoxConfig, load_config
 from bhanox.model import Bhanox
+from bhanox.quant.numerics import INT8_MAX
 from bhanox.train.bookend_mirror import layer_norm_torch
 from bhanox.train.model_mirror import BhanoxMirror
 
@@ -74,6 +79,257 @@ def _states(model: Bhanox) -> list[np.ndarray]:
 
 def _mirror_states(mirror: BhanoxMirror) -> list[np.ndarray]:
     return [_np(h.state_int) for b in mirror.banks for h in b.heads]
+
+
+# -- the split-regime contract ------------------------------------------------
+#
+# There are two regimes, and conflating them is what made the old single number
+# wrong rather than merely tight.
+#
+# *Same codes.* When the reference and the mirror quantise to identical int8
+# codes, the integer recurrence is fed bit-identical input, so every int32 state
+# is bit-exact and the only difference left is float32 accumulation order. Over
+# the grid below that is at most 1.79e-6, which is what TINY_TOL / NANO_TOL
+# police. This is the regime the mirror claim is really about.
+#
+# *A boundary flip.* The two float32 stacks do not accumulate in the same order,
+# so they differ by ~1e-6 going into the quantiser. Usually that is invisible,
+# but if it lands within 1e-6 of a half-integer the two ``round`` calls snap to
+# different codes. One flipped code moves the read by one quantisation step, and
+# the logits by up to 5.12e-3. That is not a mirror defect: forcing agreement
+# would mean reproducing NumPy's exact accumulator order, i.e. abandoning the
+# native torch path. It is a property of comparing two float32 implementations
+# across a quantiser boundary.
+#
+# The flip is also not automatically visible. seq=64 seed=6 flips a ``v`` at token
+# 58 -- the write path, at the very end -- and moves the logits by 1.67e-6, inside
+# the clean bound. So the second regime genuinely needs a *measured* end-to-end
+# limit rather than the head-side 1/127, which bounds the read and says nothing
+# about what the mixer, layer norm and unembed do to it afterwards.
+#
+# The limits below are empirical and scoped to the config and lengths named
+# beside them. A flip earlier in a longer sequence has had more steps to
+# compound, so widening the grid means re-measuring, not inheriting these.
+#
+# Every ``*_MEASURED`` constant is the worst value actually observed on the pinned
+# grid, quoted to three significant figures, and the tests assert the observations
+# never exceed it beyond that rounding. That makes the numbers in ROADMAP.md and
+# docs/architecture.md test-enforced rather than prose that quietly goes stale. Each
+# ``*_TOL`` is the documented headroom above it. A real regression is orders of
+# magnitude, not the fourth digit. The 0.5% slack below is the rounding error of a
+# 3-significant-figure constant, which can sit that far under the true observation.
+_MEASURED_SLACK = 1.005
+#
+# Two different grids are in play and their figures must not be mixed:
+#   * the pinned grids below, which is what the tests enforce and the docs quote;
+#   * a wider 20-seed sweep (100 cases, seq 8-64), run while diagnosing this and
+#     not pinned, whose clean worst was 2.03e-6 -- 4.9x inside TINY_TOL rather
+#     than 5.6x. The pinned grid is the narrower sample, so its 1.79e-6 is the
+#     better number for the same tolerance only by luck of which seeds flipped.
+TINY_TOL = 1e-5
+NANO_TOL = 1e-4
+#: Measured worst over the pinned tiny grid: 1.79e-6, i.e. TINY_TOL / 5.6.
+TINY_CLEAN_MEASURED = 1.79e-6
+#: Measured worst over the same grid: 5.12e-3. TINY_BOUNDARY_TOL / 2.3.
+TINY_BOUNDARY_MEASURED = 5.12e-3
+TINY_BOUNDARY_TOL = 1.2e-2
+#: Measured worst over the pinned nano grid: 3.81e-6, i.e. NANO_TOL / 26.
+NANO_CLEAN_MEASURED = 3.81e-6
+#: Measured worst over the same grid: 2.32e-4. NANO_BOUNDARY_TOL / 4.3.
+NANO_BOUNDARY_MEASURED = 2.32e-4
+NANO_BOUNDARY_TOL = 1e-3
+
+#: (seq, seed, regime). The regime is *measured*, then pinned here so a change
+#: in which side of a boundary a seed lands on shows up as a named failure rather
+#: than as a tolerance that mysteriously stopped holding.
+_TINY_GRID: tuple[tuple[int, int, str], ...] = (
+    (8, 0, "same"),
+    (8, 6, "same"),
+    (8, 11, "same"),
+    (16, 0, "same"),
+    (16, 6, "same"),
+    (16, 11, "flip"),  # (L1, head 0, token 9, q)
+    (32, 0, "same"),
+    (32, 6, "same"),
+    (32, 11, "flip"),
+    (48, 0, "flip"),  # (L1, head 0, token 32, k)
+    (48, 6, "same"),
+    (48, 11, "flip"),
+    (64, 0, "flip"),
+    (64, 6, "flip"),  # (L1, head 1, token 58, v) -- a late write-path flip
+    (64, 11, "flip"),
+)
+
+#: (batch, seq, seed, regime), measured the same way as _TINY_GRID. At nano the
+#: grid is kept to short windows because past a handful of tokens an occasional
+#: seed stops being a question about floating point at all.
+_NANO_GRID: tuple[tuple[int, int, int, str], ...] = (
+    (1, 1, 0, "same"),
+    (1, 1, 1, "same"),
+    (1, 1, 2, "same"),
+    (1, 8, 0, "same"),
+    (1, 8, 1, "same"),
+    (1, 8, 2, "same"),
+    (2, 4, 0, "same"),
+    (2, 4, 1, "same"),
+    (2, 4, 2, "same"),
+    (4, 4, 0, "flip"),  # one late v flip, still well inside NANO_TOL
+    (4, 4, 1, "same"),
+    (4, 4, 2, "flip"),  # four flips, 2.32e-4 -- the case the old 1e-4 claim missed
+)
+
+_OPS = ("k", "q", "v")
+
+
+class _Trace:
+    """Codes, pre-quantisation values and per-token state, tagged by position.
+
+    Tagging is structural, not positional: each side is keyed by the *actual* head
+    object plus a per-head call counter, so ``(layer, head, token, op)`` means
+    the same thing on both sides regardless of call order. A positional zip would
+    have been shorter and would have silently compared a ``k`` against a ``q`` if
+    the two orders ever diverged.
+    """
+
+    def __init__(self) -> None:
+        self.codes_ref: dict[tuple[int, int, int, str], np.ndarray] = {}
+        self.codes_mir: dict[tuple[int, int, int, str], np.ndarray] = {}
+        self.pre_ref: dict[tuple[int, int, int, str], np.ndarray] = {}
+        self.pre_mir: dict[tuple[int, int, int, str], np.ndarray] = {}
+        self.state_ref: dict[tuple[int, int, int], np.ndarray] = {}
+        self.state_mir: dict[tuple[int, int, int], np.ndarray] = {}
+        self.logits_ref: np.ndarray | None = None
+        self.logits_mir: np.ndarray | None = None
+
+    def flips(self) -> list[tuple[int, int, int, str]]:
+        """Sites where the two sides chose different int8 codes."""
+        return [
+            k
+            for k in self.codes_ref
+            if not np.array_equal(self.codes_ref[k], self.codes_mir[k])
+        ]
+
+    def first_flip_token(self) -> int | None:
+        toks = [k[2] for k in self.flips()]
+        return min(toks) if toks else None
+
+    def max_logit_diff(self) -> float:
+        assert self.logits_ref is not None and self.logits_mir is not None
+        return float(np.abs(self.logits_ref - self.logits_mir).max())
+
+
+def _trace(config: BhanoxConfig, ids: np.ndarray) -> _Trace:
+    """Run both stacks once, recording codes and state at every quantiser site."""
+    tr = _Trace()
+    ctx: dict[str, object] = {"site": None, "opn": 0}
+    count: dict[tuple, int] = defaultdict(int)
+    model = Bhanox(config)
+    mirror = BhanoxMirror(Bhanox(config))
+    nmap = {
+        id(h): (li, hi)
+        for li, b in enumerate(model.deltabanks)
+        for hi, h in enumerate(b.heads)
+    }
+    mmap = {
+        id(h): (li, hi)
+        for li, b in enumerate(mirror.banks)
+        for hi, h in enumerate(b.heads)
+    }
+
+    oq = db.quantize_activation
+    oproj, ocodes = tm.DeltaBankHeadMirror._project, tm.DeltaBankHeadMirror._codes
+    ohf, ohm = db.DeltaBankHead.forward, tm.DeltaBankHeadMirror.forward_int
+
+    def n_quant(x, *a, **k):
+        out = oq(x, *a, **k)
+        li, hi, t = ctx["site"]  # type: ignore[misc]
+        op = _OPS[ctx["opn"]]  # type: ignore[index]
+        ctx["opn"] = int(ctx["opn"]) + 1  # type: ignore[arg-type]
+        tr.codes_ref[(li, hi, t, op)] = np.asarray(out, dtype=np.int32).copy()
+        tr.pre_ref[(li, hi, t, op)] = np.asarray(x, dtype=np.float64).copy()
+        return out
+
+    def n_head(self, x, *a, **k):
+        li, hi = nmap[id(self)]
+        count["n", li, hi] += 1
+        t = count["n", li, hi] - 1
+        ctx["site"], ctx["opn"] = (li, hi, t), 0
+        out = ohf(self, x, *a, **k)
+        assert ctx["opn"] == 3, "a head must quantise exactly k, q and v"
+        tr.state_ref[(li, hi, t)] = np.array(self.state)
+        ctx["site"] = None
+        return out
+
+    def m_proj(self, x):
+        out = oproj(self, x)
+        li, hi, t = ctx["site"]  # type: ignore[misc]
+        for op, v in zip(_OPS, out, strict=True):
+            tr.pre_mir[(li, hi, t, op)] = (
+                v.detach().cpu().numpy().astype(np.float64).copy()
+            )
+        return out
+
+    def m_codes(self, x):
+        out = ocodes(self, x)
+        li, hi, t = ctx["site"]  # type: ignore[misc]
+        for op, v in zip(_OPS, out, strict=True):
+            tr.codes_mir[(li, hi, t, op)] = (
+                v.detach().cpu().numpy().astype(np.int64).copy()
+            )
+        return out
+
+    def m_head(self, x, *a, **k):
+        li, hi = mmap[id(self)]
+        count["m", li, hi] += 1
+        t = count["m", li, hi] - 1
+        ctx["site"], ctx["opn"] = (li, hi, t), 0
+        out = ohm(self, x, *a, **k)
+        tr.state_mir[(li, hi, t)] = _np(self.state_int).copy()
+        ctx["site"] = None
+        return out
+
+    db.quantize_activation, db.DeltaBankHead.forward = n_quant, n_head
+    tm.DeltaBankHeadMirror._project, tm.DeltaBankHeadMirror._codes = m_proj, m_codes
+    tm.DeltaBankHeadMirror.forward_int = m_head
+    try:
+        tr.logits_ref = model.forward(ids)
+        tr.logits_mir = _np(mirror.forward_int(torch.from_numpy(ids)))
+    finally:
+        db.quantize_activation, db.DeltaBankHead.forward = oq, ohf
+        tm.DeltaBankHeadMirror._project, tm.DeltaBankHeadMirror._codes = oproj, ocodes
+        tm.DeltaBankHeadMirror.forward_int = ohm
+
+    # Structural self-checks, so a mis-tagged trace fails here rather than
+    # producing a plausible-looking flip count.
+    seq = ids.shape[1]
+    for li, bank in enumerate(model.deltabanks):
+        for hi in range(len(bank.heads)):
+            assert count["n", li, hi] == seq, (li, hi, count["n", li, hi], seq)
+            assert count["m", li, hi] == seq, (li, hi, count["m", li, hi], seq)
+    assert set(tr.codes_ref) == set(
+        tr.codes_mir
+    ), "the two sides tagged different sites"
+    for k in tr.codes_ref:
+        assert tr.codes_ref[k].shape == tr.codes_mir[k].shape, k
+    return tr
+
+
+def _assert_flips_are_boundary_straddles(tr: _Trace) -> None:
+    """Every code difference must be a verified half-integer straddle.
+
+    This is what licenses the flip counts. If a difference showed up where the
+    two float64 products did *not* bracket a half-integer, the cause would not be
+    boundary proximity -- it would be a real quantiser or indexing bug, and the
+    whole split-regime reading would be wrong.
+    """
+    for k in tr.flips():
+        a = np.minimum(tr.pre_ref[k], tr.pre_mir[k]) * INT8_MAX
+        b = np.maximum(tr.pre_ref[k], tr.pre_mir[k]) * INT8_MAX
+        crossed = np.floor(b + 0.5) != np.floor(a + 0.5)
+        assert np.any(crossed), (
+            f"{k}: codes differ but the products [{a.min()}, {b.max()}] never "
+            f"bracket a half-integer -- not a boundary flip"
+        )
 
 
 # -- the front end ------------------------------------------------------------
@@ -195,33 +451,141 @@ def test_batched_rows_stay_independent():
 # -- logits -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("seq", [4, 16, 32, 64])
-def test_logits_agree_at_the_measured_tolerance(seq: int):
-    for seed in range(3):
-        ids = _ids(2000 + seed, 1, seq, TINY.output_vocab)
-        ref = Bhanox(TINY).forward(ids)
-        got = _np(BhanoxMirror(Bhanox(TINY)).forward_int(ids))
-        assert (
-            np.abs(ref - got).max() < TINY_TOL
-        ), f"seq={seq} seed={seed}: max|diff|={np.abs(ref - got).max():.3e}"
+@pytest.mark.parametrize(("seq", "seed", "regime"), _TINY_GRID)
+def test_tiny_logits_split_by_code_regime(seq: int, seed: int, regime: str):
+    """The logit claim, stated as the two things it actually is.
 
+    Same codes -> the clean bound, which is the real claim and holds with room to
+    spare. A flipped code -> a wider, separately measured bound, because a single
+    int8 step genuinely moves the read by 1/127 and the rest of the network
+    amplifies that.
 
-@pytest.mark.parametrize("shape", [(1, 1), (1, 8), (2, 4), (4, 4)])
-def test_nano_short_windows_meet_the_documented_claim(shape: tuple[int, int]):
-    """The 1e-4 claim, at the real config, in the window where it holds.
-
-    Deliberately short. At nano the drift has four layers to accumulate through,
-    so past a handful of tokens an occasional seed crosses a gate threshold and
-    the comparison stops being about floating point at all. That is documented
-    rather than tested away, because it is a property of the architecture --
-    ``test_the_gate_has_no_dead_band`` is the test that pins why.
+    The old single tolerance demanded the clean bound from cases that had left it,
+    which is why two seeds failed. It was not that the mirror got worse; the
+    assertion stopped describing the situation it was applied to.
     """
-    b, t = shape
-    for seed in range(3):
-        ids = _ids(3000 + seed, b, t, 256)
-        ref = Bhanox(load_config("nano")).forward(ids)
-        got = _np(BhanoxMirror(Bhanox(load_config("nano"))).forward_int(ids))
-        assert np.abs(ref - got).max() < NANO_TOL
+    tr = _trace(TINY, _ids(2000 + seed, 1, seq, TINY.output_vocab))
+    _assert_flips_are_boundary_straddles(tr)
+
+    observed = "flip" if tr.flips() else "same"
+    assert observed == regime, (
+        f"seq={seq} seed={seed} is now '{observed}', was pinned as '{regime}'; "
+        f"re-measure the grid and relabel it"
+    )
+
+    d = tr.max_logit_diff()
+    if regime == "same":
+        assert (
+            d < TINY_TOL
+        ), f"seq={seq} seed={seed} shared every code but moved {d:.3e}"
+        assert d <= TINY_CLEAN_MEASURED * _MEASURED_SLACK, (
+            f"seq={seq} seed={seed} moved {d:.3e}, worse than the recorded worst "
+            f"{TINY_CLEAN_MEASURED:.2e}; re-measure the grid and update it"
+        )
+    else:
+        assert (
+            d < TINY_BOUNDARY_TOL
+        ), f"seq={seq} seed={seed} flipped at {tr.flips()[:2]} and moved {d:.3e}"
+        assert d <= TINY_BOUNDARY_MEASURED * _MEASURED_SLACK, (
+            f"seq={seq} seed={seed} moved {d:.3e}, worse than the recorded worst "
+            f"{TINY_BOUNDARY_MEASURED:.2e}; re-measure the grid and update it"
+        )
+
+
+@pytest.mark.parametrize(("batch", "seq", "seed", "regime"), _NANO_GRID)
+def test_nano_logits_split_by_code_regime(batch: int, seq: int, seed: int, regime: str):
+    """The same split at the real config, on the short windows where it holds.
+
+    At nano the drift has four layers to accumulate through, so the window is kept
+    short. ``test_the_gate_has_no_dead_band`` pins why that is an architecture
+    property rather than a test artefact.
+    """
+    tr = _trace(load_config("nano"), _ids(3000 + seed, batch, seq, 256))
+    _assert_flips_are_boundary_straddles(tr)
+
+    observed = "flip" if tr.flips() else "same"
+    assert (
+        observed == regime
+    ), f"b={batch} t={seq} seed={seed} is now '{observed}', pinned as '{regime}'"
+
+    d = tr.max_logit_diff()
+    if regime == "same":
+        assert (
+            d < NANO_TOL
+        ), f"b={batch} t={seq} seed={seed} shared every code but moved {d:.3e}"
+        assert d <= NANO_CLEAN_MEASURED * _MEASURED_SLACK, (
+            f"b={batch} t={seq} seed={seed} moved {d:.3e}, worse than the recorded "
+            f"worst {NANO_CLEAN_MEASURED:.2e}; re-measure the grid and update it"
+        )
+    else:
+        assert (
+            d < NANO_BOUNDARY_TOL
+        ), f"b={batch} t={seq} seed={seed} flipped at {tr.flips()[:2]}, moved {d:.3e}"
+        assert d <= NANO_BOUNDARY_MEASURED * _MEASURED_SLACK, (
+            f"b={batch} t={seq} seed={seed} moved {d:.3e}, worse than the recorded "
+            f"worst {NANO_BOUNDARY_MEASURED:.2e}; re-measure the grid and update it"
+        )
+
+
+@pytest.mark.parametrize(("seq", "seed", "regime"), _TINY_GRID)
+def test_integer_state_is_bit_exact_exactly_as_far_as_the_codes_agree(
+    seq: int, seed: int, regime: str
+):
+    """Where the codes match, the int32 state is bit-exact -- not approximately.
+
+    This is the sharp half of the contract and it needs no tolerance at all. Given
+    identical codes and an identical incoming state, the integer recurrence is
+    deterministic, so any difference here would be a genuine bug rather than float
+    noise. The claim stops at the first code divergence *anywhere*, because a flip
+    in one head changes the layer's read, which changes the next head's input.
+    """
+    tr = _trace(TINY, _ids(2000 + seed, 1, seq, TINY.output_vocab))
+    first = tr.first_flip_token()
+
+    for (li, hi, t), ref_state in tr.state_ref.items():
+        if first is not None and t >= first:
+            continue
+        assert np.array_equal(ref_state, tr.state_mir[(li, hi, t)]), (
+            f"L{li} head{hi} token {t}: state differs at "
+            f"{ref_state.nonzero()[:4].tolist()}, first code flip at token {first}"
+        )
+
+    if regime == "same":
+        # No flip anywhere, so the claim above was unconditional: assert that
+        # rather than leaving it vacuous.
+        assert first is None
+        assert len(tr.state_ref) == 2 * 2 * seq
+
+
+def test_the_documented_headroom_ratios_are_the_arithmetic_they_claim_to_be():
+    """The "5.6x inside 1e-5" style figures in the docs are checked, not asserted.
+
+    These ratios are quoted in ROADMAP.md, in docs/architecture.md and in the
+    comments above, and a hand-written multiple is exactly the kind of number
+    that goes stale when a constant moves. Recomputing them here means an edit to
+    a tolerance that invalidates a documented figure fails here instead.
+
+    It also pins *which* measurement each ratio comes from. The pinned tiny grid
+    gives 1.79e-6 and so 5.6x, while the wider unpinned 20-seed sweep gave 2.03e-6
+    and so 4.9x. Both are true measurements of different samples; mixing them is
+    how a document ends up claiming 5.6x beside a 2.03e-6 figure.
+    """
+    for measured, limit, claimed, what in (
+        (TINY_CLEAN_MEASURED, TINY_TOL, 5.6, "tiny same-codes"),
+        (TINY_BOUNDARY_MEASURED, TINY_BOUNDARY_TOL, 2.3, "tiny boundary"),
+        (NANO_CLEAN_MEASURED, NANO_TOL, 26.0, "nano same-codes"),
+        (NANO_BOUNDARY_MEASURED, NANO_BOUNDARY_TOL, 4.3, "nano boundary"),
+    ):
+        ratio = limit / measured
+        assert ratio == pytest.approx(claimed, rel=0.02), (
+            f"{what}: docs say {claimed}x, but "
+            f"{limit:.3g} / {measured:.3g} = {ratio:.2f}"
+        )
+        assert ratio > 1.0, f"{what}: the limit is inside the measurement"
+
+    # The wider sweep, kept here so the 4.9x figure has a stated provenance and
+    # is not silently re-derived from the pinned grid's 5.6x.
+    assert pytest.approx(4.9, rel=0.02) == TINY_TOL / 2.03e-6
 
 
 # -- the converse -------------------------------------------------------------

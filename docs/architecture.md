@@ -37,6 +37,18 @@ The one sharp edge: the known-id test is `(arr >= 0) & (arr < vocab_table)`. The
 lower bound is load-bearing. Without it a negative id passes and numpy then
 indexes the table from the end, so `-1` silently reads the last row.
 
+Representation, which is worth knowing before you touch `quantize()` or
+`embed()`. `pool` and `table` hold int8 **codes**; the per-column absmax scale
+lives beside them in `pool_scale`/`table_scale`, and `embed` applies it. This is
+the opposite convention to `DeltaBank` and `MicroExpert` below, and on purpose:
+the front-end's arrays *are* the int8 grid that gets deployed, so storing
+dequantized floats in a field documented as codes would be a rescale wearing a
+quantization's name. Both halves have to be named, because either one alone is a
+silent 283x-795x error — the codes read as real values are that far too large,
+and the scales are checkpointed state rather than derived data. `nbytes` counts
+the scales; at nano they are 1,024 B of 1,180,672 B (0.087%), and a residency
+number that omits an array it holds stops being true as the model grows.
+
 ### DeltaBank — `src/bhanox/core/deltabank.py`
 
 Multi-head, multi-timescale recurrent memory with a delta-rule (error-correcting)
@@ -169,6 +181,27 @@ Two claims, deliberately kept apart:
   `(B, T)` block, and BLAS sums a batched product in a different order than a
   single-row one. Compare logits with `allclose`, state with `array_equal`.
 
+The same split applies to the NumPy reference against the Torch mirror, and for a
+sharper reason. The two stacks differ by ~1e-6 in float32, which is usually
+invisible — but if that difference lands within 1e-6 of a half-integer, the two
+`round` calls select different int8 codes, and one flipped code moves the read by
+a full quantisation step. So the mirror claim has **two regimes**:
+
+- **Same int8 codes.** The integer recurrence is fed bit-identical input, so the
+  int32 states compare with `array_equal` and the logits stay within the tight
+  bound (1.79e-6 measured on the two-layer config, 3.81e-6 on nano).
+- **A code flips at a quantisation boundary.** The states are still bit-exact up
+  to the first flip, but the logits get a wider, separately measured bound,
+  because a single int8 step genuinely moves them. This is a property of
+  comparing two float32 implementations across a quantiser, not a mirror defect:
+  forcing agreement would mean reproducing NumPy's exact accumulator order.
+
+Both bounds are empirical and scoped to the config and sequence lengths they were
+measured on. The head-side `1/127` is *not* a valid end-to-end limit — it bounds
+the read, not what the mixer, layer norm and unembed do to it. Full grid, measured
+worst cases, and the structural check that every code difference really is a
+half-integer straddle are in `ROADMAP.md` and `tests/test_model_mirror.py`.
+
 The time loop stays outermost in `_run_memory`, because the recurrence is
 sequential in `t` and there is nothing to vectorise across it. The batch is
 real rather than a throughput knob for the mixer alone.
@@ -216,6 +249,70 @@ uninterrupted run, and dropping it does not, so neither test can pass for the
 wrong reason. The matching assertion is on the **weights** (`== 0.0`); the logits
 are compared with a documented float32 tolerance, because the two paths reach the
 same answer by summing in a different order and BLAS picks that order per build.
+
+### The walk carries arrays, so scalars are a separate block
+
+The same walk that cannot lose a parameter also cannot see a `filled` that is a
+plain `int`. The VectorVault is the case where that matters: restoring its slot
+tables while `filled` and `clock` came back at `0` produced a vault that
+answered no query — `query` short-circuits on `filled == 0` — and that handed out
+slot 0 on every write, overwriting one recovered entry per write and orphaning
+the rest, with no exception anywhere on the path.
+
+So the vault's `filled`, `clock`, `theta_s` and `perm_budget_bytes` travel in a
+namespaced `runtime` block in the metadata, versioned separately, and `load()`
+restores them automatically and validates them against the arrays beside them
+(`n_slots` is recorded as a cross-check, not restored). Two properties follow:
+
+- **A resume is consistent or refused.** Validation runs *before* any array is
+  written, so a bad block leaves the target untouched. A checkpoint holding vault
+  arrays with no such block is refused, because restoring it is the bug.
+  `filled=0` next to populated arrays is no longer reachable.
+- **The version stays 1.** The tensor layout did not change, and nano and mini
+  checkpoints — which have no vault — read exactly as before. The block's own
+  `version` field is what a future layout moves.
+
+Pinned in `tests/test_checkpoint_vault.py`, including the behavioural claim: two
+models differing only in how many times they were loaded agree slot-for-slot and
+clock-for-clock on the next ten writes.
+
+This fixes one item only. **Exact training resume is still BLOCKED** — there is no
+optimizer, scheduler, RNG state or data position to restore. See *ROADMAP*.
+
+## Generation: two id spaces
+
+The model does not use one "token". `HashBind` embeds one packed byte 4-gram per
+position, and the unembedding is `(d_model, output_vocab)` with
+`output_vocab == 256`. So a model *input* is a 32-bit id naming four bytes, and a
+model *output class* is a single byte value in `0..255`. The two spaces are not
+interchangeable, and nothing about the types says so: a byte value is a valid
+`int64` and therefore a valid input id.
+
+Generation bridges them by rolling. After sampling byte `b`, the next context is
+the previous three bytes plus `b`, re-encoded by `encode_bytes` — never `b`
+itself, which would be the unrelated 4-gram `0x000000XX`. The public API is
+byte-oriented (`model.generate(prompt: bytes, ...) -> bytes`) so the ids stay
+internal, and `generate_ids` exists for callers who already hold them. It returns
+*only* the generated byte values, as `uint8`, because the caller still has the
+prompt ids and the two must not end up in one array.
+
+Three consequences worth stating:
+
+- `str` prompts are refused rather than encoded. The output is bytes and is not
+  guaranteed to be valid UTF-8, so an API that quietly converted text in would
+  invite reading the result as text.
+- `output_vocab != 256` is refused before sampling. `BhanoxConfig` only asks for
+  `output_vocab > 0`, so a 1000-way head is constructible, and its sampled class
+  would not be a byte.
+- The loop feeds one context at a time via `step`, not a window via `forward`, so
+  generation is not bounded by `max_context`. That limit exists for training
+  windows; the model is O(1) in context at runtime and can be prompted with
+  anything that fits in memory.
+
+`tests/test_gram_contract.py` pins the rolling with a recording stub that
+substitutes `step` and captures the ids the model is actually fed, then asserts
+those ids are exactly the 4-gram windows of the returned bytes. A bare byte feed
+is a valid `int64`, so this is checked by observation rather than by type.
 
 ## Assembly
 

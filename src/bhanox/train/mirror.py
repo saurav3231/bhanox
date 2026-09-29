@@ -77,6 +77,7 @@ from bhanox.core.deltabank import _RECIP, DeltaBankHead
 from bhanox.quant.numerics import INT8_MAX, to_q
 from bhanox.train.ste import (
     MAX8,
+    int8_codes,
     l2_normalize,
     quantize_activation,
     sigmoid,
@@ -85,6 +86,23 @@ from bhanox.train.ste import (
 )
 
 __all__ = ["DeltaBankHeadMirror"]
+
+
+def _host(t: Tensor) -> np.ndarray:
+    """A detached CPU numpy copy of ``t``, whatever device it lives on.
+
+    The one place the mirror is allowed to leave the device. ``Tensor.numpy()``
+    only accepts CPU tensors, so a straight ``.numpy()`` raised on CUDA and the
+    integer state advance -- the part of the recurrence that cannot be skipped --
+    died on a GPU. ``.detach()`` alone is not enough: it drops the graph, not the
+    device.
+
+    The numpy round-trip itself is deliberate and is not the bug: ``to_q`` is the
+    reference's quantiser, shared rather than reimplemented so the two cannot
+    drift. It stays a host operation, and the sync it implies was already implied
+    by sharing it.
+    """
+    return t.detach().to("cpu").numpy()
 
 
 class DeltaBankHeadMirror(nn.Module):
@@ -201,12 +219,14 @@ class DeltaBankHeadMirror(nn.Module):
         ``quantize_activation`` ends in ``.astype(np.int32)`` and the rest of the
         path is int32, so producing floats here would both lose exactness and make
         the ``>> 16`` shifts fail outright.
+
+        The arithmetic is delegated to :func:`bhanox.train.ste.int8_codes` so the
+        integer path and the training surrogate use the reference's float64
+        product. Computing it here in float32 instead was a real but separate
+        fidelity gap -- see that function for the measurement.
         """
         k, q, v = self._project(x)
-        k8 = torch.clamp(torch.round(k * INT8_MAX), -MAX8, MAX8).to(torch.int32)
-        q8 = torch.clamp(torch.round(q * INT8_MAX), -MAX8, MAX8).to(torch.int32)
-        v8 = torch.clamp(torch.round(v * INT8_MAX), -MAX8, MAX8).to(torch.int32)
-        return k8, q8, v8
+        return tuple(int8_codes(t).to(torch.int32) for t in (k, q, v))
 
     @torch.no_grad()
     def forward_int(self, x: Tensor, bank_rates: Tensor) -> Tensor:
@@ -254,14 +274,23 @@ class DeltaBankHeadMirror(nn.Module):
     def _write_int(
         self, state: Tensor, k8: Tensor, e8: Tensor, v8: Tensor, bank_rates: Tensor
     ) -> Tensor:
+        # ``_host`` on every numpy round-trip. The two ``.numpy()`` calls these
+        # replace raised on a CUDA tensor, so a GPU run died in the integer state
+        # advance -- the one place the recurrence cannot be skipped. The
+        # round-trip through numpy is the reference's quantiser, deliberately
+        # shared rather than reimplemented, so it stays a host operation and the
+        # only cost is the sync the reference already implied.
         lam_q = torch.tensor(
-            np.array(to_q(self.decay(bank_rates).detach().numpy())), dtype=torch.int32
+            np.array(to_q(_host(self.decay(bank_rates).detach()))),
+            dtype=torch.int32,
+            device=state.device,
         )
         k_sq = (k8.float() * k8.float()).sum(dim=1) / float(MAX8**2)
         index = torch.clamp(torch.round(k_sq), 1.0, 255.0).long()
         beta_q = torch.tensor(
-            np.array(to_q(self.recip[index - 1].numpy().astype(np.float64) * self.eta)),
+            np.array(to_q(_host(self.recip[index - 1]).astype(np.float64) * self.eta)),
             dtype=torch.int32,
+            device=state.device,
         )
         if self.write_mode == "additive":
             e8 = v8
@@ -419,7 +448,7 @@ class DeltaBankHeadMirror(nn.Module):
             self.state_int.copy_(torch.tensor(np.array(head.state), dtype=torch.int32))
 
     def to_numpy_state(self) -> np.ndarray:
-        return self.state_int.numpy().copy()
+        return _host(self.state_int).copy()
 
     def extra_repr(self) -> str:
         return f"d_in={self.d_in}, d_k={self.d_k}, d_v={self.d_v}, eta={self.eta}"

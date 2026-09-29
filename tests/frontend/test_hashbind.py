@@ -146,8 +146,18 @@ class TestHashBind:
             hb.HashBind(d_model=8, pool_size=16, vocab_table=32)
 
     def test_nbytes_counts_pool_and_table(self) -> None:
+        """Residency is the int8 codes plus the stored per-column scales.
+
+        The scales are counted because ``nbytes`` is the number invariant I2
+        and the audit report, and a residency figure that omits an array the
+        module holds stops being true as the model grows. They are
+        ``2 * d_model`` float32 next to ``(pool_size + vocab_table) * d_model``
+        int8 codes, so here that is 64 bytes on top of 160.
+        """
         emb = hb.HashBind(d_model=8, pool_size=16, vocab_table=4)
-        assert emb.nbytes == (16 + 4) * 8
+        codes = (16 + 4) * 8
+        scales = 2 * 8 * 4  # pool_scale + table_scale, float32
+        assert emb.nbytes == codes + scales
 
     def test_collisions_are_rare(self) -> None:
         """4-gram ids are 32 bits and the pool is 8192 rows, so distinct ids
@@ -177,8 +187,15 @@ class TestHashBind:
         assert_integral(emb.pool, where="pool")
 
     def test_param_count(self) -> None:
+        """Codes, scales and mix weights are all stored values.
+
+        The two scale vectors are counted because they are stored, not
+        recomputed. At the nano shape that is ``2 * 128`` out of over a
+        million pool codes, so it does not move the parameter claim; it is
+        counted anyway so the number means "everything this object holds".
+        """
         emb = hb.HashBind(d_model=8, pool_size=16, vocab_table=4, n_hashes=2)
-        assert emb.param_count() == 16 * 8 + 4 * 8 + 2
+        assert emb.param_count() == 16 * 8 + 4 * 8 + 2 * 8 + 2
 
     def test_calling_the_object_equals_embed(self) -> None:
         emb = hb.HashBind(d_model=8)
