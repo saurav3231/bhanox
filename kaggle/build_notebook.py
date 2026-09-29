@@ -12,9 +12,13 @@ limits. An earlier draft re-implemented the corpus and the training loop inline;
 that was a second copy of the same code that could drift from the real one, so
 it was deleted rather than maintained.
 
-**This notebook has never been run on a Kaggle GPU.** Its code cells are
-exercised locally, and the clone step is the only thing that has never run at
-all. There is no result to quote until someone runs it.
+**Status: the short smoke in this notebook has run on a Kaggle GPU and passed**
+(context 32, batch 1, two steps, finite losses, on a real T4). That result is at
+context 32 only.
+
+**The full-context T=4,096 probe is opt-in and has not been run.** It lives in the
+same repository as `t4096_probe`, gated behind a flag this notebook does not set.
+There is no T=4,096 result to quote until someone runs it.
 """
 
 from __future__ import annotations
@@ -35,6 +39,12 @@ WORKDIR = "/kaggle/working"
 MAX_EXAMPLES = 32
 STEPS = 2
 TIME_CAP_S = 240
+
+#: The full-context capacity probe is deliberately **not** enabled here. It is one
+#: update at context 4,096 with no timeout and an unknown runtime, and it must be
+#: started by hand. Flip this to True only when you mean to spend that quota, and
+#: expect to watch the cell rather than wait on a known number.
+RUN_T4096_PROBE = False
 
 CELLS: list[tuple[str, str]] = []
 
@@ -63,9 +73,15 @@ here.
 speed claim and no energy claim**, and it is not evidence of language quality --
 see "Honest limits" at the bottom.
 
-**Status: the Kaggle CUDA path has not been run.** As of writing this notebook
-has never executed on a Kaggle GPU. The clone step below has not run either.
-Until you run it, there is no result to quote.
+**Status: the short smoke below has run on a Kaggle GPU and passed** -- a real
+T4, context 32, batch 1, two steps, finite losses, both steps completed. Treat
+that as evidence for context 32 and nothing wider.
+
+**The opt-in T=4,096 capacity probe has not been run.** It is not part of this
+notebook: it is a separate, much more expensive activity
+(`bhanox.train.smoke.t4096_probe`, one update at the full context, no timeout,
+unknown runtime) that must be started deliberately. A T=4,096 result does not
+exist yet.
 
 **No dataset required.** Nothing is uploaded, nothing is attached, and there is
 no Kaggle dataset step. An earlier version of this notebook told you to zip
@@ -171,27 +187,52 @@ for i in range(torch.cuda.device_count()):
 
 # --------------------------------------------------------------------------
 md(r"""
-## 4. Run the bounded smoke
+## 4. Run the smoke (or, if you mean it, the opt-in T=4096 probe)
 
-`cuda_smoke` builds the mirror, moves it to the device, and runs the real
-`run_documents` / AdamW / `bhanox.data` windowing over a deterministic in-memory
-byte cycle. It requires the device explicitly, so it cannot fall back to CPU
-even if this cell is edited.
+By default this runs `cuda_smoke`: it builds the mirror, moves it to the device,
+and runs the real `run_documents` / AdamW / `bhanox.data` windowing over a
+deterministic in-memory byte cycle. It requires the device explicitly, so it
+cannot fall back to CPU even if this cell is edited. It prints the resolved
+commit, the device, the configuration, per-step loss and argmax accuracy,
+elapsed time, and peak CUDA memory for **this** context.
 
-It prints the resolved commit, the device, the configuration, per-step loss and
-argmax accuracy, elapsed time, and peak CUDA memory for **this** context.
+Setting `RUN_T4096_PROBE = True` above switches to `t4096_probe` instead:
+**exactly one** real optimizer update at the full context of 4,096, on
+deterministic *varied* synthetic bytes. Before you flip it, read what it costs:
+
+- **It is not cheap.** The short smoke above took ~34 s for *two* steps at
+  context 32; this is one step at 128x the context. **No runtime is predicted
+  here, and none should be inferred** from that ratio.
+- **There is no timeout.** A wall-clock cap cannot interrupt a blocked
+  `train_chunk`, so one that appeared to would fire only after the expensive
+  work was already done. The function prints a warning; watching the cell and
+  interrupting by hand is the actual safeguard.
+- **A failure is a result.** On OOM or any runtime error it reports the exact
+  failure, elapsed time and peak memory, then re-raises. It does not shrink the
+  context, retry, or switch devices.
+- The probe's loss is a **meaningless diagnostic** -- the bytes are uniform
+  random, so a value near `ln(256) = 5.545` is the expected outcome, not a
+  failure.
 """)
 
 code(f"""
-from bhanox.train.smoke import cuda_smoke
+from bhanox.train.smoke import cuda_smoke, t4096_probe
 
-result = cuda_smoke(
-    device=torch.device("cuda:0"),
-    config="nano",
-    steps={STEPS},
-    max_examples={MAX_EXAMPLES},
-    time_cap_s={TIME_CAP_S},
-)
+RUN_T4096_PROBE = {RUN_T4096_PROBE!r}
+
+if RUN_T4096_PROBE:
+    # Expensive and off by default. One update at context 4,096, no timeout,
+    # unknown runtime. Read the banner it prints before running it, and be
+    # ready to interrupt the cell by hand.
+    result = t4096_probe(device=torch.device("cuda:0"), config="nano")
+else:
+    result = cuda_smoke(
+        device=torch.device("cuda:0"),
+        config="nano",
+        steps={STEPS},
+        max_examples={MAX_EXAMPLES},
+        time_cap_s={TIME_CAP_S},
+    )
 
 print()
 print("raw result:", result)
@@ -214,17 +255,32 @@ from this cell.
 """)
 
 code(r"""
-ok = bool(result["all_finite"]) and bool(result["finished"])
-print(f"pass: {ok}")
-print()
-if not ok:
-    print("See the console output above for the reason. This cell only")
-    print("summarises; the real diagnosis is in the per-step table.")
+if RUN_T4096_PROBE:
+    ok = bool(result["completed"]) and bool(result["loss_finite"])
+    print(f"completed: {ok}")
+    print()
+    if ok:
+        print(f"One synthetic update at context {result['context']} completed on")
+        print(f"{result['device']}: it fits, and the loss, gradients and")
+        print("parameters are finite. That is the whole claim. It is not")
+        print("sustained training, throughput, quality, energy, or evidence")
+        print("that a long run's checkpoint/resume would work.")
+    else:
+        print("The update did not complete. See the console output above:")
+        print("it reports the exact failure and the peak memory reached.")
+        print("An OOM at full context is a measurement, not a bug to retry.")
 else:
-    print("Forward, backward and an optimizer update all completed on")
-    print(f"{result['device']} at context {result['max_examples']}.")
-    print("That is the whole claim. It is not a speed result, an energy")
-    print("result, a quality result, or a T=4096 result.")
+    ok = bool(result["all_finite"]) and bool(result["finished"])
+    print(f"pass: {ok}")
+    print()
+    if not ok:
+        print("See the console output above for the reason. This cell only")
+        print("summarises; the real diagnosis is in the per-step table.")
+    else:
+        print("Forward, backward and an optimizer update all completed on")
+        print(f"{result['device']} at context {result['max_examples']}.")
+        print("That is the whole claim. It is not a speed result, an energy")
+        print("result, a quality result, or a T=4096 result.")
 """)
 
 # --------------------------------------------------------------------------
@@ -265,8 +321,17 @@ Read this before quoting any number from this run.
    `strict=True`), so a checkpoint milestone needs a mechanism written and a
    decision about what may be claimed when resuming.
 
-6. **No Kaggle result exists yet.** This notebook has not been run on Kaggle
-   hardware. Everything above describes what it *checks*, not what it found.
+6. **The short smoke has a Kaggle result; the T=4,096 probe does not.** The
+   short smoke ran on a real T4 and passed: forward, backward and AdamW, two
+   steps, context 32, batch 1, finite losses, both steps completed. That is a
+   verified result **at context 32 only**.
+
+   The full-context probe (`bhanox.train.smoke.t4096_probe`) is **opt-in and
+   unrun**. It is deliberately not wired into this notebook: it is one update at
+   context 4,096, with **no timeout** and an **unknown** runtime, and a failure
+   there is a real measurement rather than something to retry. Until it is run
+   and its output shared, **full-context memory fits is unproven**, and no
+   throughput, energy, or quality claim exists at any context.
 """)
 
 

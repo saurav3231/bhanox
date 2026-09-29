@@ -81,23 +81,34 @@ import numpy as np
 import torch
 
 from bhanox.config import BhanoxConfig, load_config
+from bhanox.data import examples_for, iter_examples
 from bhanox.frontend.hashbind import BYTE_GRAM_N
 from bhanox.model import Bhanox
 from bhanox.train.model_mirror import BhanoxMirror
 from bhanox.train.objective import trainable_parameters
-from bhanox.train.trainer import build_optimizer, run_documents
+from bhanox.train.trainer import build_optimizer, run_documents, train_chunk
 
 __all__ = [
     "SMOKE_CYCLE",
+    "T4096_CONTEXT",
     "accuracy_on_cycle",
     "build_documents",
+    "build_probe_document",
     "cuda_smoke",
     "main",
+    "t4096_probe",
 ]
 
 #: The repeating byte cycle. Period 5, so every 4-gram in it maps to exactly one
 #: next byte and the task is a finite-state function rather than noise.
 SMOKE_CYCLE = b"ABCDE"
+
+#: The full planned context. ``nano``'s ``max_context``, and the window the
+#: opt-in capacity probe runs at. Named here so the number lives in one place:
+#: it is the single most expensive thing in the smoke suite, and a probe that
+#: quietly ran at a smaller window would be a different, much cheaper experiment
+#: wearing this one's name.
+T4096_CONTEXT = 4096
 
 
 def build_documents(
@@ -124,6 +135,44 @@ def build_documents(
     return [
         bytes(cycle[i % period] for i in range(n_bytes)) for _ in range(n_documents)
     ]
+
+
+def build_probe_document(n_bytes: int, *, seed: int = 0) -> bytes:
+    """Deterministic, *varied* synthetic bytes for the full-context probe.
+
+    Distinct from :func:`build_documents` on purpose. The short smoke wants a
+    learnable 5-cycle, so a falling loss says something about the gradient path.
+    The full-context probe wants the opposite: bytes that are not a short
+    repeating pattern, so the loss sits near the ``ln(256)`` noise floor and the
+    number is reported as a *diagnostic only* -- never as learning, and never as
+    evidence the model is good. A cycle at T=4096 would be 4096/5 = 819
+    repetitions of the same five bytes, which invites exactly the wrong reading.
+
+    The bytes are drawn from a seeded :class:`numpy.random.Generator`, so the
+    same ``seed`` gives the same document and a failed run can be reproduced.
+    They are uniform over the full byte range rather than over a restricted
+    alphabet, so no 4-gram is degenerate and the input distribution is the
+    densest one available -- the hardest case for a lookup-style embedder, and
+    therefore the least flattering capacity test.
+
+    Args:
+        n_bytes: Length in bytes. Must be at least ``context + BYTE_GRAM_N`` for
+            the document to yield ``context`` examples.
+        seed: Seed for the byte draw. Draws the *bytes* only; it does not touch
+            the model initialisation, which the caller seeds separately.
+
+    Returns:
+        One ``bytes`` object of length ``n_bytes``.
+
+    Note:
+        This is in-memory only. Nothing is read from disk, downloaded, or
+        cached, and the bytes are not a corpus: they are not text, carry no
+        meaning, and are discarded when the process exits.
+    """
+    if n_bytes < 1:
+        raise ValueError(f"n_bytes must be at least 1, got {n_bytes}")
+    generator = np.random.default_rng(seed)
+    return generator.integers(0, 256, n_bytes, dtype=np.uint8).tobytes()
 
 
 def accuracy_on_cycle(
@@ -394,6 +443,326 @@ def cuda_smoke(
     }
 
 
+def t4096_probe(
+    *,
+    device: torch.device,
+    config: str = "nano",
+    context: int = T4096_CONTEXT,
+    lr: float = 1e-3,
+    seed: int = 0,
+    stream=None,
+) -> dict[str, object]:
+    """Opt-in capacity probe: exactly one real update at the full context.
+
+    Separate from :func:`cuda_smoke` on purpose, and **not** a default. The short
+    smoke is the quick gate and stays that way. This one answers a different
+    question -- *does a full-context window fit and run on this device at all* --
+    and the two must not be conflated, because a pass here is a statement about
+    capacity and nothing else.
+
+    What it does, exactly:
+
+    - Builds one synthetic document of ``context + BYTE_GRAM_N`` bytes from
+      :func:`build_probe_document`: deterministic, varied, uniform over all 256
+      byte values. **Not** a repeating cycle, so the loss is a meaningless
+      diagnostic and is labelled as one. Nothing is read, downloaded, or cached.
+    - Asserts the generated example count is exactly ``context``, that ids are
+      below ``2**(8 * BYTE_GRAM_N)`` and targets lie in ``0..output_vocab - 1``,
+      before any tensor is built. A probe that silently ran on 4092 examples
+      because of an off-by-one would report a green capacity result for a
+      context it never touched.
+    - Runs **one** chunk through :func:`~bhanox.train.trainer.train_chunk`: the
+      real mirror, the real forward, the real ``cross_entropy``, the real
+      backward, the real AdamW step. Not a reimplementation.
+    - Resets peak-memory stats *after* building the model and optimizer and
+      *immediately before* the update, so the reported peak is the update's, not
+      the setup's. Synchronises on both sides of the timed region, so the elapsed
+      time is the update's and not the queue's.
+
+    Args:
+        device: Where to run. Required and explicit, like :func:`cuda_smoke`.
+        config: Config preset name. ``max_context`` must be at least ``context``.
+        context: Positions in the single update. Defaults to :data:`T4096_CONTEXT`.
+        lr: AdamW learning rate.
+        seed: Seeds the byte draw and weight init.
+        stream: Callable to write progress lines to, or ``None`` for ``print``.
+
+    Returns:
+        A dict with ``completed``, ``context``, ``loss``, ``loss_finite``,
+        ``grads_finite``, ``params_finite``, ``elapsed_s``, ``peak_alloc_mib``,
+        ``peak_reserved_mib``, and the free/total memory seen before the update.
+
+    Raises:
+        RuntimeError: If CUDA is unavailable or ``device_count()`` is 0. There is
+            no CPU fallback: a capacity result measured on CPU would answer a
+            question nobody asked.
+        ValueError: If ``context`` is below 1, or exceeds the config's
+            ``max_context``.
+        torch.cuda.OutOfMemoryError: Propagated unchanged, after the exact
+            failure has been emitted. The probe does **not** silently shrink the
+            context, retry on another device, or fall back -- an OOM at full
+            context is the answer, and papering over it would destroy the only
+            thing this function exists to measure.
+
+    Note:
+        There is deliberately **no timeout**. A wall-clock cap cannot interrupt a
+        blocked ``train_chunk`` -- it would only be checked *after* the update
+        returned, by which point the GPU has already done the work. A fake
+        timeout that cannot fire is worse than none: it reads like a safety rail
+        in the signature while providing none. The cost is unknown and can be
+        large; the caller is expected to watch the cell and interrupt it by hand.
+
+    What a pass does and does not mean
+    ----------------------------------
+    One synthetic T=4096 update completed on that device: it fits in memory, the
+    full context runs, and loss, gradients and post-update parameters are finite.
+    It does **not** establish sustained training, throughput, learning on a real
+    corpus, quality, energy use, or that checkpointing would work in a long run.
+    One update cannot show any of those, and none of them may be inferred from a
+    pass.
+    """
+    if context < 1:
+        raise ValueError(f"context must be at least 1, got {context}")
+
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise RuntimeError(
+            f"t4096_probe is a CUDA capacity probe and was given {device}. It has "
+            "no CPU path on purpose: a peak-memory number from CPU RAM would say "
+            "nothing about whether the full context fits in a GPU, which is the "
+            "only question this function exists to answer. Use cuda_smoke() for "
+            "the quick CPU-suitable smoke."
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "t4096_probe requires CUDA and torch.cuda.is_available() is False. On "
+            "Kaggle, set Accelerator to a GPU in the right-hand Settings panel. "
+            "There is no CPU fallback here by design."
+        )
+    count = torch.cuda.device_count()
+    if count < 1:
+        raise RuntimeError("CUDA is available but device_count() is 0.")
+    index = 0 if device.index is None else device.index
+    if index >= count:
+        raise RuntimeError(
+            f"asked for {device} but only {count} CUDA device(s) are visible. "
+            "This probe uses exactly one device."
+        )
+
+    emit = stream or (lambda line: print(line, flush=True))
+
+    emit("!! FULL-CONTEXT CAPACITY PROBE -- OPT-IN, AND NOT CHEAP !!")
+    emit(
+        f"One real optimizer update at context {context}. Runtime is UNKNOWN and "
+        "may take substantial GPU time and quota:"
+    )
+    emit(
+        "the T=32 smoke above took ~34 s for TWO steps, and this is 128x the "
+        "context in a single update. No linear extrapolation is offered, because "
+        "none is trustworthy. There is no timeout in this function: a wall-clock "
+        "cap cannot interrupt a blocked train_chunk."
+    )
+    emit("Watch the cell. If it must be stopped, interrupt it manually.")
+    emit("")
+
+    cfg: BhanoxConfig = load_config(config)
+    if context > cfg.max_context:
+        raise ValueError(
+            f"context {context} exceeds the {cfg.name} config's max_context="
+            f"{cfg.max_context}. Raise the config or lower the context; do not "
+            "ask the mirror for a window it has already promised to reject."
+        )
+
+    gpu_names = [
+        torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+    ]
+
+    emit("=== environment ===")
+    emit(f"python           {sys.version.split()[0]}")
+    emit(f"torch            {torch.__version__}")
+    emit(f"torch cuda build {torch.version.cuda}")
+    emit(f"cuda available   {torch.cuda.is_available()}")
+    emit(f"device count     {count}")
+    for i, name in enumerate(gpu_names):
+        emit(f"  cuda:{i}  {name}")
+    emit(f"running on       {device}")
+    if len(gpu_names) > 1:
+        emit(
+            f"NOTE: {len(gpu_names)} GPUs visible. This run uses {device} only "
+            "-- no DataParallel, no DDP, no multi-GPU work."
+        )
+    emit("")
+    emit("=== probe configuration ===")
+    emit(
+        f"config {cfg.name}: d_model={cfg.d_model} n_layers={cfg.n_layers} "
+        f"n_heads={cfg.n_heads} max_context={cfg.max_context} "
+        f"output_vocab={cfg.output_vocab}"
+    )
+    emit(f"batch 1 | context {context} positions | steps 1 | lr {lr} | seed {seed}")
+
+    # The data contract is checked before any tensor exists, so a bad document
+    # cannot be reported as an OOM or a capacity result.
+    n_bytes = context + BYTE_GRAM_N
+    document = build_probe_document(n_bytes, seed=seed)
+    examples, targets = examples_for(document)
+    assert len(examples) == context, (
+        f"expected exactly {context} examples from {n_bytes} bytes, got "
+        f"{len(examples)}; the probe would be measuring a different context"
+    )
+    assert len(targets) == context, (
+        f"expected exactly {context} targets, got {len(targets)}"
+    )
+    id_ceiling = 1 << (8 * BYTE_GRAM_N)
+    assert int(examples.min()) >= 0 and int(examples.max()) < id_ceiling, (
+        f"example ids must lie in [0, {id_ceiling}) for {BYTE_GRAM_N}-grams; got "
+        f"{int(examples.min())}..{int(examples.max())}"
+    )
+    assert int(targets.min()) >= 0 and int(targets.max()) < cfg.output_vocab, (
+        f"targets must lie in [0, {cfg.output_vocab}) for output_vocab="
+        f"{cfg.output_vocab}; got {int(targets.min())}..{int(targets.max())}"
+    )
+    emit(
+        f"data: 1 synthetic document of {n_bytes} deterministic varied bytes "
+        f"(seed {seed}), uniform over all 256 byte values. In memory only -- no "
+        "corpus is read or downloaded, and these bytes are not text."
+    )
+    emit(
+        f"examples {len(examples)} (ids < {id_ceiling}, targets in "
+        f"[0, {cfg.output_vocab})) -- asserted"
+    )
+    emit("")
+
+    free_before, total = torch.cuda.mem_get_info(device)
+    emit("=== device memory before the update ===")
+    emit(f"free   {free_before / (1024**2):,.1f} MiB")
+    emit(f"total  {total / (1024**2):,.1f} MiB")
+
+    torch.manual_seed(seed)
+    mirror = BhanoxMirror(Bhanox(cfg)).to(device)
+    optimizer = build_optimizer(mirror, lr=lr)
+    n_params = sum(p.numel() for p in trainable_parameters(mirror))
+    emit(f"model built and moved to {device} ({n_params:,} trainable values)")
+
+    # The real pipeline, not a hand-rolled forward. One document of exactly
+    # ``context`` examples yields exactly one chunk, hence exactly one update.
+    chunk = next(
+        iter_examples([document], max_examples=context, seed=seed, name="t4096-probe")
+    )
+    assert len(chunk) == context, (
+        f"expected one chunk of {context} positions, got {len(chunk)}"
+    )
+
+    # Reset *here*: after the model and optimizer exist, immediately before the
+    # update. Resetting earlier would fold setup allocations into the peak and
+    # overstate what the update needs.
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+
+    emit("")
+    emit(f"=== running ONE update at context {context} (batch 1) ===")
+    started = time.perf_counter()
+    error: str | None = None
+    oom: torch.cuda.OutOfMemoryError | None = None
+    loss_value: float | None = None
+    try:
+        report, _ = train_chunk(mirror, optimizer, chunk)
+        loss_value = report.loss
+    except torch.cuda.OutOfMemoryError as exc:
+        # Kept so it can be re-raised *after* the report is printed. The report is
+        # the expensive part of the result: the peak reached before the failure is
+        # the most informative number an OOM produces.
+        oom = exc
+        error = f"torch.cuda.OutOfMemoryError: {exc}"
+    except RuntimeError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    torch.cuda.synchronize(device)
+    elapsed_s = time.perf_counter() - started
+
+    peak_alloc = torch.cuda.max_memory_allocated(device) / (1024**2)
+    peak_reserved = torch.cuda.max_memory_reserved(device) / (1024**2)
+
+    if error is not None:
+        emit("")
+        emit("=== FAILED ===")
+        emit(f"the single update did not complete: {error}")
+        emit(f"elapsed               {elapsed_s:.2f} s")
+        emit(f"peak allocated        {peak_alloc:.1f} MiB")
+        emit(f"peak reserved         {peak_reserved:.1f} MiB")
+        emit("")
+        emit("Reported as-is. This probe does NOT shrink the context, retry, or")
+        emit("switch devices: an OOM at full context is the measurement.")
+        emit("")
+        emit("=== what this is not ===")
+        emit("A failure here is evidence about capacity only. It says nothing")
+        emit("about throughput, quality, energy, or whether a smaller context")
+        emit("would train -- none of which was measured.")
+        if oom is not None:
+            raise oom
+        raise RuntimeError(error)
+
+    grads_finite = all(
+        bool(torch.isfinite(p.grad).all())
+        for p in trainable_parameters(mirror)
+        if p.grad is not None
+    )
+    params_finite = all(
+        bool(torch.isfinite(p).all()) for p in trainable_parameters(mirror)
+    )
+
+    emit("")
+    emit("=== result ===")
+    emit(f"update completed     {error is None}")
+    emit(f"context               {context} positions, batch 1, 1 update")
+    emit(
+        f"loss                  {loss_value:.4f}   (MEANINGLESS DIAGNOSTIC)"
+        if loss_value is not None
+        else "loss                  n/a"
+    )
+    emit(
+        f"loss finite           {loss_value is not None and math.isfinite(loss_value)}"
+    )
+    emit(f"gradients finite      {grads_finite}")
+    emit(f"parameters finite     {params_finite}")
+    emit(f"elapsed               {elapsed_s:.2f} s (synchronised either side)")
+    emit(f"peak allocated        {peak_alloc:.1f} MiB")
+    emit(f"peak reserved         {peak_reserved:.1f} MiB")
+    emit(f"free before update    {free_before / (1024**2):,.1f} MiB")
+    emit(f"device total          {total / (1024**2):,.1f} MiB")
+    if error is not None:
+        emit(f"error                 {error}")
+
+    emit("")
+    emit("=== what this is not ===")
+    emit("One synthetic T=4096 update completed (or failed) on one device. That is")
+    emit("all it establishes. It does NOT show: sustained training, throughput,")
+    emit("learning on a real corpus, language quality, energy use, or that a long")
+    emit("run's checkpoint/resume would work. The bytes are uniform random, so the")
+    emit("loss above carries no learning signal and is a diagnostic only; a value")
+    emit("near ln(256) is the expected result, not a failure.")
+    emit("No GPU speed or energy claim is made or implied by any number above.")
+
+    return {
+        "device": str(device),
+        "gpu_names": gpu_names,
+        "config": cfg.name,
+        "context": context,
+        "batch": 1,
+        "steps": 1,
+        "completed": error is None,
+        "loss": loss_value,
+        "loss_finite": loss_value is not None and math.isfinite(loss_value),
+        "grads_finite": grads_finite,
+        "params_finite": params_finite,
+        "elapsed_s": elapsed_s,
+        "peak_alloc_mib": peak_alloc,
+        "peak_reserved_mib": peak_reserved,
+        "free_before_mib": free_before / (1024**2),
+        "total_mib": total / (1024**2),
+        "trainable_params": n_params,
+        "error": error,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the smoke test and print its curve.
 
@@ -429,9 +798,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--time-cap", type=float, default=240.0, help="wall-clock cap in seconds"
     )
+    parser.add_argument(
+        "--t4096-probe",
+        action="store_true",
+        help=(
+            "Run the opt-in full-context capacity probe instead of the short "
+            "smoke: exactly ONE real update at context 4096, on CUDA, with "
+            "varied synthetic bytes. Expensive and off by default; see "
+            "t4096_probe()."
+        ),
+    )
+    parser.add_argument(
+        "--t4096-context",
+        type=int,
+        default=T4096_CONTEXT,
+        help=f"context for --t4096-probe (default {T4096_CONTEXT})",
+    )
     args = parser.parse_args(argv)
     if args.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {args.steps}")
+
+    if args.t4096_probe:
+        device = torch.device(args.device or "cuda:0")
+        result = t4096_probe(
+            device=device,
+            config=args.config,
+            context=args.t4096_context,
+            lr=args.lr,
+            seed=args.seed,
+        )
+        # Exit code reflects completion and finiteness only. A failure path has
+        # already raised, so reaching here means the update ran.
+        ok = bool(
+            result["completed"] and result["loss_finite"] and result["grads_finite"]
+        )
+        return 0 if ok else 1
 
     if args.device is not None:
         result = cuda_smoke(

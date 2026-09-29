@@ -48,8 +48,9 @@ import numpy as np
 import pytest
 import torch
 
-from bhanox.config import BhanoxConfig
-from bhanox.data import document_chunks
+from bhanox.config import BhanoxConfig, load_config
+from bhanox.data import document_chunks, examples_for, iter_examples
+from bhanox.frontend.hashbind import BYTE_GRAM_N
 from bhanox.model import Bhanox
 from bhanox.train import mixer_mirror
 from bhanox.train.model_mirror import BhanoxMirror
@@ -60,7 +61,15 @@ from bhanox.train.objective import (
     unknown_parameter_names,
 )
 from bhanox.train.reset import clear_shadows, reset_mirror
-from bhanox.train.smoke import SMOKE_CYCLE, accuracy_on_cycle, build_documents, main
+from bhanox.train.smoke import (
+    SMOKE_CYCLE,
+    T4096_CONTEXT,
+    accuracy_on_cycle,
+    build_documents,
+    build_probe_document,
+    main,
+    t4096_probe,
+)
 from bhanox.train.trainer import (
     ChunkReport,
     DocumentReport,
@@ -1173,3 +1182,159 @@ def test_contract_k_is_exact_against_numpy_einsum() -> None:
             "bkv,bk->bv", state.numpy().astype(np.int64), codes.numpy().astype(np.int64)
         )
         assert np.array_equal(result.numpy(), by_numpy), "diverged from np.einsum"
+
+
+def test_probe_document_is_exactly_the_requested_context() -> None:
+    """``context + BYTE_GRAM_N`` varied bytes must yield exactly ``context`` examples.
+
+    The capacity probe is a claim about one specific window. If the document
+    were one byte short, the chunker would emit a shorter final chunk and the
+    probe would report a green result for a context it never actually ran, so
+    the arithmetic is pinned here rather than trusted to a comment.
+    """
+    n_bytes = T4096_CONTEXT + BYTE_GRAM_N
+    document = build_probe_document(n_bytes, seed=0)
+    assert len(document) == n_bytes
+
+    examples, targets = examples_for(document)
+    assert len(examples) == T4096_CONTEXT
+    assert len(targets) == T4096_CONTEXT
+
+    # And it must be a single chunk at that window, so "one update" is honest.
+    chunks = list(
+        iter_examples([document], max_examples=T4096_CONTEXT, seed=0, name="t4096")
+    )
+    assert len(chunks) == 1
+    assert len(chunks[0]) == T4096_CONTEXT
+
+
+def test_probe_bytes_are_varied_deterministic_and_in_range() -> None:
+    """The probe's bytes must be varied, reproducible, and in the real id contract.
+
+    Three separate properties, so three separate reasons to fail:
+
+    - *Varied*: a short repeating cycle would make a full-context loss readable
+      as learning. Uniform random over the whole byte range is the least
+      flattering input available, and is checked against several short periods.
+    - *Deterministic*: a failed 4096-context run costs real GPU quota, so the
+      same seed has to reproduce the same document bit for bit.
+    - *In range*: ids below ``2**(8 * BYTE_GRAM_N)`` and targets inside
+      ``output_vocab``, which is the contract ``encode_bytes`` documents.
+    """
+    n_bytes = T4096_CONTEXT + BYTE_GRAM_N
+    cfg = load_config("nano")
+    document = build_probe_document(n_bytes, seed=0)
+
+    assert document == build_probe_document(n_bytes, seed=0)
+    assert document != build_probe_document(n_bytes, seed=1)
+
+    values = np.frombuffer(document, dtype=np.uint8)
+    assert len(set(values)) == 256, "probe bytes should span the whole byte range"
+    for period in (2, 3, 4, 5, 7, 13):
+        assert not np.array_equal(values[:-period], values[period:]), (
+            f"probe bytes repeat with period {period}, which makes a "
+            "full-context loss readable as learning"
+        )
+
+    examples, targets = examples_for(document)
+    assert int(examples.min()) >= 0
+    assert int(examples.max()) < 1 << (8 * BYTE_GRAM_N)
+    assert int(targets.min()) >= 0
+    assert int(targets.max()) < cfg.output_vocab
+
+
+def test_t4096_probe_refuses_to_run_without_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No CPU path, and no silent fallback. A CPU peak is not a capacity answer.
+
+    A CPU measurement would be worse than useless here: the question is whether
+    a full context fits in a *GPU*, and host RAM would answer a different one
+    while looking like a pass. Both a non-CUDA device and an unavailable CUDA
+    build must be refused outright.
+    """
+    with pytest.raises(RuntimeError, match="no CPU path on purpose"):
+        t4096_probe(device=torch.device("cpu"))
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="no CPU fallback here by design"):
+        t4096_probe(device=torch.device("cuda:0"))
+
+
+def test_t4096_probe_refuses_an_impossible_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A context above the config's ``max_context`` must be rejected, not clamped.
+
+    Clamping is the failure mode that matters: the probe would silently measure a
+    smaller window than the one it is named for, and its whole purpose is to
+    answer a question about a specific context.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda i: "fake")
+    with pytest.raises(ValueError, match="exceeds"):
+        t4096_probe(device=torch.device("cuda:0"), context=99_999)
+
+
+def test_t4096_probe_reports_a_failure_and_reraises(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An OOM is reported in full, then re-raised unchanged -- never retried.
+
+    The peak reached before the failure is the most informative number an OOM
+    produces, so it has to reach the user *before* the exception does. And the
+    exception has to survive: a probe that swallowed an OOM, shrank the context,
+    or moved to another device would turn the measurement into a pass.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda i: "fake")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 12345)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *a, **k: 23456)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (10**9, 2 * 10**9))
+    # A CPU-only build cannot allocate on cuda:0, so only the device move is
+    # stubbed; everything after it is the real path.
+    monkeypatch.setattr(torch.nn.Module, "to", lambda self, *a, **k: self)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise torch.cuda.OutOfMemoryError(
+            "CUDA out of memory. Tried to allocate 99 GiB"
+        )
+
+    monkeypatch.setattr("bhanox.train.smoke.train_chunk", boom)
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="99 GiB"):
+        t4096_probe(device=torch.device("cuda:0"), context=64)
+
+    printed = capsys.readouterr().out
+    assert "=== FAILED ===" in printed
+    assert "99 GiB" in printed
+    assert "does NOT shrink the context" in printed
+
+
+def smoke_module_path() -> str:
+    """Filesystem path of the smoke module, for the source-order assertion."""
+    import bhanox.train.smoke
+
+    return pathlib.Path(bhanox.train.smoke.__file__).resolve()
+
+
+def test_t4096_probe_warns_before_running() -> None:
+    """The cost warning must be printed *before* the update, not documented somewhere.
+
+    The probe has no timeout by design -- a wall-clock cap cannot interrupt a
+    blocked ``train_chunk``, so a cap would be a safety rail in the signature
+    that fires only after the expensive work is already done. The warning is the
+    only guard there is, which is why it has to be unmissable and early.
+    """
+    source = pathlib.Path(smoke_module_path()).read_text(encoding="utf-8")
+    warn_at = source.index("!! FULL-CONTEXT CAPACITY PROBE")
+    update_at = source.index("train_chunk(mirror, optimizer, chunk)")
+    assert warn_at < update_at, "the warning must precede the update"
+
+    # The two promises the warning has to keep, asserted so neither can be
+    # quietly dropped from the banner later.
+    assert "not cheap" in source.lower()
+    assert "no timeout" in source.lower()

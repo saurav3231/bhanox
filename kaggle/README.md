@@ -3,8 +3,13 @@
 A private, manual **correctness-only** check that runs Bhanox's real trainer on a
 Kaggle GPU, on synthetic data. Nothing is published.
 
-**This has never been run on a Kaggle GPU.** There is no result to quote until
-you run it.
+**Status.** The short Gate A smoke has been run on a Kaggle GPU and **passed**:
+a real T4 completed forward, backward, and AdamW for two short-context steps
+(context 32, batch 1) with finite losses. That verified result is at **context
+32 only** and says nothing about any other context.
+
+There is now a second, **opt-in** probe for the full planned context of 4,096.
+It has **not** been run. There is no result to quote for it until you run it.
 
 ## What this is for
 
@@ -62,6 +67,69 @@ told you to zip `src/` and upload it as a private Kaggle dataset. That step is
 gone: the source now comes from a **public `git clone`**, which is simpler and
 keeps the notebook pointed at one specific commit.
 
+## The two runs: quick smoke, and the expensive opt-in probe
+
+Both call into the same cloned repository, and both use synthetic in-memory bytes.
+Neither needs a corpus, an approved licence, or a checkpoint/resume path, because
+neither is a long run and neither reads anything from disk. They differ only in
+what they ask and what they cost.
+
+| | **quick smoke (default)** | **T=4096 probe (opt-in)** |
+|---|---|---|
+| entry point | `cuda_smoke` | `t4096_probe` |
+| context | 32 (configurable) | **4,096**, fixed per call |
+| updates | 2 | **exactly 1** |
+| wall-clock | bounded by an explicit cap | **no cap; runtime unknown** |
+| data | repeating 5-byte cycle (learnable) | deterministic varied bytes (noise) |
+| answers | does training run on this GPU? | does the full window fit and run? |
+| cost | seconds to a couple of minutes | **unknown; may be substantial** |
+
+The quick smoke is the default and stays that way. The probe is gated behind a
+flag you have to set yourself (`RUN_T4096_PROBE = True` in the handoff cell, or
+`--t4096-probe` on the CLI). **It does not run unless you flip that flag.**
+
+### About the probe's cost, stated plainly
+
+The probe is **not cheap** and this file will not pretend otherwise. The verified
+T=32 run above took about 34 seconds for *two* steps; the probe is a single step
+at 128x that context. **No runtime prediction is offered here, and none should
+be inferred** -- a linear extrapolation from the T=32 number is not a runtime,
+because the recurrence's per-token host/device synchronisation does not scale
+linearly with anything.
+
+The probe has **no timeout, by design**. A wall-clock cap cannot interrupt a
+blocked `train_chunk`; it would only be checked after the update returned, by
+which point the GPU has already done the work. A timeout that cannot fire is
+worse than none, because it reads like a safety rail while providing none. So the
+function prints a loud warning before it starts, and **the caller is expected to
+watch the cell and interrupt manually**.
+
+On failure -- an out-of-memory error, or any runtime error -- the probe reports
+the exact failure, the elapsed time, and the peak memory reached, then re-raises.
+It does **not** shrink the context, retry, or switch devices. An OOM at full
+context *is* the measurement; papering over it would destroy the only thing the
+probe exists to find out.
+
+### What a probe pass does and does not prove
+
+Proves, and only this: **one synthetic T=4096 update completed on that device.**
+It fit in memory, the full context ran, and the loss, gradients, and post-update
+parameters were finite.
+
+Does **not** prove: sustained training; throughput; learning on a real corpus;
+language quality; energy use; or that checkpointing and resume would work in a
+long run. One update cannot demonstrate any of those, and none of them may be
+inferred from a pass.
+
+The probe's loss is labelled a **meaningless diagnostic** in its own output. The
+bytes are uniform random, so the next byte is genuinely unpredictable and the loss
+sits near `ln(256) = 5.545`. **A value at or above that floor is the expected
+result, not a failure** -- unlike the quick smoke, a low loss here would mean
+nothing either.
+
+**The T=4,096 probe has not been run and has not passed.** Until you run it and
+share the output, the full-context claim is unverified.
+
 ## Setup
 
 1. **Create a private notebook.** `Code -> New Notebook`. Do not add a title --
@@ -90,6 +158,10 @@ peak CUDA memory       <MiB> MiB (this context only)
 `all losses finite True` and `completed all steps True` is the pass condition.
 Accuracy above the `1/256` chance floor is the signal that the gradient path
 reaches the weights.
+
+Note the `(this context only)` on the memory line. It is load-bearing: a peak
+measured at context 32 is a floor for context 4,096, not an estimate of it, and
+the probe exists precisely because that number was unknown.
 
 If the run reports more than one visible GPU, note that it used **exactly one**,
 `cuda:0`. There is no DataParallel and no DDP.
@@ -171,7 +243,8 @@ result. It is not: it was a **single, un-warmed, CPU-only probe at `T=64`,
 batch 1** (forward + backward + AdamW, no data loading) with **no repeats, no
 variance, and no phase breakdown** -- not a steady-state benchmark. The
 256-position median above supersedes it. **A 4096-position chunk has never been
-measured**; any figure for it is an extrapolation, not a runtime.
+measured**; any figure for it is an extrapolation, not a runtime. The opt-in
+probe is the first thing that can actually measure it.
 
 ## Regenerating the notebook
 
@@ -185,6 +258,10 @@ Edit `kaggle/build_notebook.py` and re-run it. The notebook is a thin wrapper;
 all of the training logic lives in `bhanox.train.smoke.cuda_smoke`, which is
 covered by `tests/test_trainer.py`.
 
-**The GPU path has never been executed.** It is proven only by a real run on
-Kaggle, and until that happens neither this file nor the notebook can claim
-otherwise.
+**The GPU path has been executed for the short smoke**, and passed, at context
+32 on a real T4. Everything wider than that -- the full 4,096 context, throughput,
+sustained training -- is still unproven, and the opt-in probe exists to test one
+step of it and nothing more. Neither smoke makes a GPU speed claim or an energy
+claim, and a Kaggle GPU is not a way to learn anything about the product: the
+stated goal is **CPU-native** operation, so GPU results say nothing about fast or
+low-energy CPU inference, in either direction.
